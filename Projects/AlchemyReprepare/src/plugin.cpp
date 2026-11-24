@@ -26,6 +26,7 @@
 #include "playermodule/I_ActionSets.h"
 #include "playermodule/C_Alchemy.h"
 #include "playermodule/C_AlchemyRecipeDatabase.h"
+#include "Offsets/vtables/ITimer.h"
 
 using namespace wh::playermodule;
 
@@ -85,7 +86,10 @@ bool Stock(C_Alchemy* alc, C_AlchemyRecipe* recipe)
         if (!item) return false;
         stock.push_back(item->m_wuid);
     }
-    alc->ClearIngredientSlots();
+    // Clean the table first exactly like Autobrew's Arming step: the inherited Reset() virtual
+    // despawns leftover content visuals, clears buckets, teleports props home and tail-calls
+    // ClearIngredientSlots.  Stocking without it leaves the station props hidden after a brew.
+    alc->Reset();
     for (auto& w : stock) alc->ApplyIngredient(w);
     return true;
 }
@@ -97,8 +101,6 @@ void Register()
     if (!as) return;
     as->RegisterAction(kCtx, kAction, [] {
         g_pressed = true;
-        if (auto* env = SSystemGlobalEnvironment::GetInstance(); env && env->pLog)
-            env->pLog->LogAlways("[AlchemyReprepare] action callback fired");
     }, 1);
     as->SetActionVisible(kCtx, kAction, 0, 1);
     as->SetActionEnabled(kCtx, kAction, false, 1);
@@ -140,25 +142,15 @@ void Tick()
                 (visible && !lit && idle) ? "dlg_alch_not_all_ingredients" : "", 1);
         }
 
-        // ---- diagnostics: log every state change ----
-        {
-            static int last = -1;
-            const int st = (int)visible | ((int)lit << 1) | ((int)idle << 2) | ((int)atTable << 3) |
-                           ((int)inReading << 4) | ((int)(bs.m_mode == E_AlchemyMode::Brewing) << 5) |
-                           ((int)(alc->GetEffectiveState() == E_AlchemyInteractionState::Idle) << 6) |
-                           ((int)alc->m_director.IsSlotOccupied(E_AlchemyDirectorSlot::Verb) << 7) |
-                           ((int)(inv && recipe && recipe->CanBrewFrom(inv)) << 8);
-            if (st != last) {
-                last = st;
-                if (auto* env = SSystemGlobalEnvironment::GetInstance(); env && env->pLog)
-                    env->pLog->LogAlways("[AlchemyReprepare] ctx=%s mode=%d eff=%d verbBusy=%d recipe=%u canBrew=%d visible=%d lit=%d",
-                        context, (int)bs.m_mode, (int)alc->GetEffectiveState(),
-                        (int)alc->m_director.IsSlotOccupied(E_AlchemyDirectorSlot::Verb),
-                        g_lastRecipeId, (int)(inv && recipe && recipe->CanBrewFrom(inv)), (int)visible, (int)lit);
-            }
-        }
-        const bool pressed = g_pressed;
+        bool pressed = g_pressed;
         g_pressed = false;
+        {
+            static double lastFire = -10.0;
+            auto* env = SSystemGlobalEnvironment::GetInstance();
+            const double now = (env && env->pTimer) ? env->pTimer->GetCurrTimeD(Offsets::ITimer::ETIMER_UI) : 0.0;
+            if (pressed && now - lastFire < 0.4) pressed = false;
+            if (pressed) lastFire = now;
+        }
         if (pressed && !lit)
             if (auto* env = SSystemGlobalEnvironment::GetInstance(); env && env->pLog)
                 env->pLog->LogAlways("[AlchemyReprepare] pressed but not lit");
