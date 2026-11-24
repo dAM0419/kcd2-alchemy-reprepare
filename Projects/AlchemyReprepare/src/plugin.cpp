@@ -95,7 +95,11 @@ void Register()
     if (g_registered) return;
     auto* as = ActionSets();
     if (!as) return;
-    as->RegisterAction(kCtx, kAction, [] { g_pressed = true; }, 1);
+    as->RegisterAction(kCtx, kAction, [] {
+        g_pressed = true;
+        if (auto* env = SSystemGlobalEnvironment::GetInstance(); env && env->pLog)
+            env->pLog->LogAlways("[AlchemyReprepare] action callback fired");
+    }, 1);
     as->SetActionVisible(kCtx, kAction, 0, 1);
     as->SetActionEnabled(kCtx, kAction, false, 1);
     g_registered = true;
@@ -136,8 +140,28 @@ void Tick()
                 (visible && !lit && idle) ? "dlg_alch_not_all_ingredients" : "", 1);
         }
 
+        // ---- diagnostics: log every state change ----
+        {
+            static int last = -1;
+            const int st = (int)visible | ((int)lit << 1) | ((int)idle << 2) | ((int)atTable << 3) |
+                           ((int)inReading << 4) | ((int)(bs.m_mode == E_AlchemyMode::Brewing) << 5) |
+                           ((int)(alc->GetEffectiveState() == E_AlchemyInteractionState::Idle) << 6) |
+                           ((int)alc->m_director.IsSlotOccupied(E_AlchemyDirectorSlot::Verb) << 7) |
+                           ((int)(inv && recipe && recipe->CanBrewFrom(inv)) << 8);
+            if (st != last) {
+                last = st;
+                if (auto* env = SSystemGlobalEnvironment::GetInstance(); env && env->pLog)
+                    env->pLog->LogAlways("[AlchemyReprepare] ctx=%s mode=%d eff=%d verbBusy=%d recipe=%u canBrew=%d visible=%d lit=%d",
+                        context, (int)bs.m_mode, (int)alc->GetEffectiveState(),
+                        (int)alc->m_director.IsSlotOccupied(E_AlchemyDirectorSlot::Verb),
+                        g_lastRecipeId, (int)(inv && recipe && recipe->CanBrewFrom(inv)), (int)visible, (int)lit);
+            }
+        }
         const bool pressed = g_pressed;
         g_pressed = false;
+        if (pressed && !lit)
+            if (auto* env = SSystemGlobalEnvironment::GetInstance(); env && env->pLog)
+                env->pLog->LogAlways("[AlchemyReprepare] pressed but not lit");
         if (pressed && lit) {
             const bool ok = Stock(alc, recipe);
             if (auto* env = SSystemGlobalEnvironment::GetInstance(); env && env->pLog)
