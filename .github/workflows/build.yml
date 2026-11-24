@@ -1,0 +1,38 @@
+name: Build AlchemyReprepare
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      BUILD_DIR: .buildenv/build
+      VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with: { arch: amd64 }
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: ${{ runner.temp }}/vcpkg
+          vcpkgGitCommitId: 'a0b1c8d3a477c1cb4813d8e127a56961707ca42b'
+      - name: Configure
+        run: cmake -S .buildenv -B ${{ env.BUILD_DIR }} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_TOOLCHAIN_FILE=${{ runner.temp }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      - name: Build
+        shell: bash
+        run: cmake --build $BUILD_DIR 2>&1 | tee build.log; exit ${PIPESTATUS[0]}
+      - name: Publish DLL to build branch
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p out
+          cp build.log out/ || true
+          find "$BUILD_DIR" -name 'AlchemyReprepare.dll' -exec cp {} out/ \; || true
+          git config user.name "ci"; git config user.email "ci@users.noreply.github.com"
+          git checkout --orphan build-out
+          git rm -rf --cached . >/dev/null
+          git add -f out
+          git commit -m "build ${GITHUB_SHA}" && git push -f origin build-out

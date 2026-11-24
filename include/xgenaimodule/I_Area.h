@@ -1,0 +1,41 @@
+#pragma once
+#include "../CryEngine/CryCommon/Cry_Math.h"
+#include "../framework/WUID.h"
+
+// -----------------------------------------------
+// wh::xgenaimodule::I_Area -- area interface; MI base of C_TriggerArea /
+// C_AreaUnion (@+0x60) and C_SmartArea (@+0x188) (KCD2 WHGame.dll 1.5.6, kd7u).
+// sizeof 0x08.
+// -----------------------------------------------
+// RTTI mangled .?AVI_Area@xgenaimodule@wh@@. Shape (17 slots) read from the
+// subobject vtables: C_TriggerArea rva 0x3A6C0E0, C_AreaUnion rva 0x3B27A40,
+// C_SmartArea rva 0x3AA3E78. [0] Overlaps tests a point against the area [V].
+// [3] returns AABB by value: TriggerArea/SmartArea sub_180467FD4; AreaUnion
+// sub_180873BD4 unions its members. [1], [10], [15] retain unresolved roles.
+
+namespace wh::xgenaimodule {
+
+class I_Area {
+public:
+    inline static constexpr auto RTTI = Offsets::RTTI_I_Area;
+    virtual bool Overlaps(const Vec3& pos) = 0;                  // [0]
+    virtual const wh::framework::WUID& GetWuid() const = 0;      // [1]
+    virtual void ArVf2()  = 0;   // [2]  [U role]
+    virtual AABB GetAABB() = 0;  // [3]  returns the area's world bounds [V]
+    virtual void ArVf4()  = 0;   // [4]  [U role]
+    virtual void ArVf5()  = 0;   // [5]  [U role]
+    virtual void ArVf6()  = 0;   // [6]  nullsub in both areas [U role]
+    virtual void ArVf7()  = 0;   // [7]  [U role]
+    virtual void ArVf8()  = 0;   // [8]  [U role]
+    virtual void ArVf9()  = 0;   // [9]  [U role]
+    virtual void ArVf10() = 0;   // [10] shared body sub_1805CB3E8 [U role]
+    virtual void ArVf11() = 0;   // [11] [U role]
+    virtual void ArVf12() = 0;   // [12] [U role]
+    virtual void ArVf13() = 0;   // [13] [U role]
+    virtual void ArVf14() = 0;   // [14] [U role]
+    virtual void ArVf15() = 0;   // [15] shared body sub_18213A608 [U role]
+    virtual void ArVf16() = 0;   // [16] [U role]
+};
+static_assert(sizeof(I_Area) == 0x08, "interface: vtable pointer only");
+
+}  // namespace wh::xgenaimodule
