@@ -173,8 +173,8 @@ void Render(float draw)
     auto alphaAt = [&](float s, float base) -> std::uint8_t {
         float a = base;
         if (s < 1.6f) a *= (s / 1.6f);                       // fade in from the arrow tip
-        const float far = g_s[g_np - 1];
-        if (!g_hit && s > far - 20.0f) a *= (far - s) / 20.0f; // fade out where nothing is hit
+        const float sEnd = g_s[g_np - 1];
+        if (!g_hit && s > sEnd - 20.0f) a *= (sEnd - s) / 20.0f; // fade out where nothing is hit
         if (a < 0) a = 0;
         return static_cast<std::uint8_t>(a);
     };
