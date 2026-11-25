@@ -161,10 +161,55 @@ void Simulate(V3 p0, V3 v0)
     }
 }
 
+// The shooting actions update on a worker thread; aux geometry submitted there is dropped by the retail
+// renderer (that is also why the game's own wh_w_DebugTrajectory shows nothing).  The preview is therefore
+// computed in the action update and handed to the main thread, which submits it once per frame.
+SRWLOCK g_lock = SRWLOCK_INIT;
+V3     g_shV[kMaxTri];
+ColorB g_shC[kMaxTri];
+int    g_shN = 0;
+double g_shStamp = -1.0;
+double Now();
+void Publish()
+{
+    AcquireSRWLockExclusive(&g_lock);
+    std::memcpy(g_shV, g_vtx, sizeof(V3) * g_nv);
+    std::memcpy(g_shC, g_col, sizeof(ColorB) * g_nv);
+    g_shN = g_nv; g_shStamp = Now();
+    ReleaseSRWLockExclusive(&g_lock);
+}
+DWORD g_hookTid = 0;
+void DrawShared()                       // main thread, every frame
+{
+    if (!g_on || !g_ready) return;
+    if (!TryAcquireSRWLockShared(&g_lock)) return;
+    const bool fresh = g_shN > 0 && (Now() - g_shStamp) < 0.12;   // stale -> preview ended
+    if (fresh) {
+        void* aux = Aux();
+        if (aux) {
+            std::uint32_t oldF = 0, tmp = 0, newF = kFlags;
+            VCall<void*>(aux, 0x10 / 8, &oldF);                    // GetRenderFlags(&out)
+            VCall<void*>(aux, 0x08 / 8, &tmp, &newF);              // SetRenderFlags(&old, &new)
+            VCall<void>(aux, 0xA0 / 8, static_cast<const V3*>(g_shV), static_cast<std::uint32_t>(g_shN),
+                        static_cast<const ColorB*>(g_shC));      // DrawTriangles(v, n, colours*)
+            VCall<void*>(aux, 0x08 / 8, &tmp, &oldF);              // restore
+        }
+        static bool once = false;
+        if (!once && g_log) {
+            once = true;
+            auto* env = SSystemGlobalEnvironment::GetInstance();
+            void* rnd = env ? static_cast<void*>(env->pRenderer) : nullptr;
+            void* th  = rnd ? At<void*>(rnd, 0xF8) : nullptr;
+            TP_LOG("draw thread=%lu hook thread=%lu renderer main/render=%u/%u aux=%p verts=%d", GetCurrentThreadId(),
+                   g_hookTid, th ? At<std::uint32_t>(th, 0xF0) : 0, th ? At<std::uint32_t>(th, 0xF4) : 0, aux, g_shN);
+        }
+    }
+    ReleaseSRWLockShared(&g_lock);
+}
+
 void Render(float draw)
 {
-    void* aux = Aux();
-    if (!aux || g_np < 2) return;
+    if (g_np < 2) return;
     g_nv = 0;
     const V3 up{ 0, 0, 1 };
     const bool full = draw >= 0.999f;
@@ -208,13 +253,7 @@ void Render(float draw)
             Tri(o1, k, i1, k, i0, k);
         }
     }
-    if (g_nv == 0) return;
-    std::uint32_t oldF = 0, tmp = 0, newF = kFlags;
-    VCall<void*>(aux, 0x10 / 8, &oldF);                        // GetRenderFlags(&out)
-    VCall<void*>(aux, 0x08 / 8, &tmp, &newF);                  // SetRenderFlags(&old, &new)
-    VCall<void>(aux, 0xA0 / 8, static_cast<const V3*>(g_vtx), static_cast<std::uint32_t>(g_nv),
-                static_cast<const ColorB*>(g_col));          // DrawTriangles(v, n, colours*)
-    VCall<void*>(aux, 0x08 / 8, &tmp, &oldF);                  // restore
+    Publish();
 }
 
 double Now()
@@ -226,6 +265,7 @@ double Now()
 void Preview(void* action, float draw)
 {
     if (!g_on || !g_ready) return;
+    g_hookTid = GetCurrentThreadId();
     auto* fw = CCryAction::GetInstance();
     if (!fw) return;
     void* player = fw->GetClientActor();
@@ -330,6 +370,15 @@ bool HookAt(std::size_t rva, void* detour, void** orig)
 }
 
 bool g_started = false;
+bool g_tickFault = false;
+void Tick()
+{
+    if (!g_tickFault) {
+        __try { DrawShared(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_tickFault = true; TP_LOG("draw faulted -- drawing disabled"); }
+    }
+    KCSE::GetTaskInterface()->AddTask(&Tick);
+}
 
 }  // namespace
 
@@ -362,6 +411,7 @@ KCSE_PLUGIN_LOAD(kcse)
             env->pConsole->RegisterCVarFloat("tp_g", &g_grav, g_grav, VF_NULL, "Trajectory preview: gravity");
             env->pConsole->RegisterCVarFloat("tp_ring", &g_ring, g_ring, VF_NULL, "Trajectory preview: impact ring radius (m)");
         }
+        KCSE::GetTaskInterface()->AddTask(&Tick);
     });
     TP_LOG("v4 loaded: hooks charging=%d aiming=%d instant=%d hit=%d -> %s", h1, h2, h3, h4, g_ready ? "ready" : "OFF");
     return true;
