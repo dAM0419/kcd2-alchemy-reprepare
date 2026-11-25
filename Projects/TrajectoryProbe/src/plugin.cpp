@@ -1,28 +1,28 @@
-// TrajectoryProbe -- measurement build for a ranged-weapon trajectory preview (KCD2 1.5.6).
-// v2: input polled (mouse GetAsyncKeyState + XInput pad), proximity scan removed.
-// Logs (to kcd.log, prefix [TP]):
-//   * every press/release of the fire/aim keys with the game time (draw duration),
-//   * the view camera position/direction at each release,
-//   * the flight track of every fast-moving entity that appears near the camera right after a
-//     release (projectile spawn point, initial velocity, gravity -- fitted offline),
-//   * the exact impact point of the player's missile hits on actors (S_DamageEventData).
-// Draws a TEST arc on the HUD while the fire key is held, to verify the drawing pipeline
-// (HUD movie clip + Scaleform drawing API).  The arc uses guessed values (cvars tp_v0, tp_g);
-// it is NOT the final prediction.
+// TrajectoryProbe v4 -- real-time ranged trajectory preview for KCD2 1.5.6 (Steam, WHGame TimeDateStamp 0x6A350E20).
+//
+// How it works (all addresses reverse-engineered from WHGame 1.5.6, see FINDINGS):
+//   * Runs ONLY inside the game's own shooting-action updates (C_ActorActionShootingCharging / Aiming /
+//     InstantCharging ::Update, vtable slot 41).  Those exist only while a ranged weapon is being drawn or
+//     held, so nothing ever runs in menus, loading screens, melee, dialogue...
+//   * Draw progress = Charging+0xA8 (0..1, exactly what the game passes to the shot on release); Aiming = 1.
+//   * Launch point + direction = the game's GetFireFrame (0x289B28C) -> the arrow tip, no guessing.
+//   * Launch speed = the game's own speed function (0x289B594): Power, limb, arrow weight, draw, perks.
+//   * Path = analytic parabola (arrow.xml: gravity 9.0, no drag); collision = the same RayWorldIntersection
+//     helper and flags (objtypes 0x11F, flags 0x40F) the game's fire routine uses.
+//   * Drawing = engine aux geometry, world-space triangles: a horizontal ribbon of fixed metric width, so it
+//     thins with distance by itself and is hidden behind geometry (depth test on).  Impact = ring lying on
+//     the hit surface.
+// The build refuses to run on any other WHGame build (TimeDateStamp check).
 #include <MinHook.h>
 #include <windows.h>
 #include <cmath>
 #include <cstring>
-#include <memory>
-#include <vector>
-#include <unordered_map>
-#include <unordered_set>
+#include <cstdint>
 
 #include "KCSE/KCSEAPI.h"
 #include "crysystem/CCryAction.h"
 #include "crysystem/SSystemGlobalEnvironment.h"
 #include "REL.h"
-#include "Offsets/vtables/ITimer.h"
 
 namespace {
 
@@ -31,298 +31,272 @@ namespace {
         _env->pLog->LogAlways("[TP] " fmt, ##__VA_ARGS__); \
 } while (0)
 
-int   g_draw   = 1;      // tp_draw: test arc on/off
-int   g_log    = 1;      // tp_log
-float g_v0     = 52.0f;  // tp_v0: guessed full-draw speed (m/s) for the TEST arc only
-float g_g      = 9.0f;   // tp_g: gravity used by the TEST arc
-float g_full   = 1.2f;   // tp_full: seconds to full draw (vanilla BowChargeDurationMax)
+constexpr std::uint32_t kGameStamp = 0x6A350E20;
+
+// ---- game RVAs (WHGame 1.5.6) ----------------------------------------------------------------
+constexpr std::size_t kChargingUpdate = 0x28A1044;   // C_ActorActionShootingCharging vt[41]
+constexpr std::size_t kAimingUpdate   = 0x28A0E70;   // C_ActorActionShootingAiming vt[41]
+constexpr std::size_t kInstantUpdate  = 0x28A126C;   // C_ActorActionShootingInstantCharging vt[41]
+constexpr std::size_t kShootCtx       = 0x7F3310;    // (actor+0x280 obj) -> ctx {+0x40 weapon, +0x48 ammo}
+constexpr std::size_t kGetFireFrame   = 0x289B28C;   // (_, out{pos,axA,dir}, actor, weapon)
+constexpr std::size_t kLaunchSpeed    = 0x289B594;   // (_, float draw, weapon, ammo, stats) -> m/s
+constexpr std::size_t kRwiHelper      = 0x4846E4;    // RayWorldIntersection inline helper
+
+// ---- settings (console cvars) -----------------------------------------------------------------
+int   g_on     = 1;        // tp_on
+int   g_log    = 1;        // tp_log
+float g_width  = 0.035f;   // tp_width : ribbon width (m)
+float g_grav   = 9.0f;     // tp_g     : gravity (arrow.xml)
+float g_ring   = 0.18f;    // tp_ring  : impact ring radius (m)
+
+bool g_ready = false;      // all checks passed
+
+// ---- game function types -----------------------------------------------------------------------
+using UpdateFn     = std::int64_t(__fastcall*)(void* self, float dt);
+using ShootCtxFn   = void*(__fastcall*)(void* holder);
+using FireFrameFn  = void*(__fastcall*)(void* unused, float* out, void* actor, void* weapon);
+using LaunchSpdFn  = float(__fastcall*)(void* unused, float draw, void* weapon, void* ammo, void* stats);
+struct RayHit { float dist; void* pCollider; int ipart, partid; short surface_idx, idmatOrg;
+                int foreignIdx, iNode; float pt[3]; float n[3]; int bTerrain, iPrim; void* next; char pad[32]; };
+using RwiFn = int(__fastcall*)(void* world, const float* org, const float* dir, int objtypes, unsigned flags,
+                               RayHit* hits, int nMax, void* skip, int nSkip, void* fd, int ifd, const char* tag);
+
+UpdateFn    o_charging = nullptr, o_aiming = nullptr, o_instant = nullptr;
+ShootCtxFn  f_shootCtx = nullptr;
+FireFrameFn f_fireFrame = nullptr;
+LaunchSpdFn f_speed = nullptr;
+RwiFn       f_rwi = nullptr;
+
+template <class T> T At(const void* p, std::size_t off) { return *reinterpret_cast<const T*>(static_cast<const char*>(p) + off); }
+template <class R, class... A> R VCall(void* obj, std::size_t slot, A... a)
+{
+    auto vt = *reinterpret_cast<void***>(obj);
+    return reinterpret_cast<R(__fastcall*)(void*, A...)>(vt[slot])(obj, a...);
+}
+
+// ---- small vector helpers ------------------------------------------------------------------------
+struct V3 { float x, y, z; };
+inline V3 operator+(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+inline V3 operator-(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+inline V3 operator*(V3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
+inline float Dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+inline V3 Cross(V3 a, V3 b) { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+inline float Len(V3 a) { return std::sqrt(Dot(a, a)); }
+inline V3 Norm(V3 a, V3 fb = { 1, 0, 0 }) { const float l = Len(a); return l > 1e-6f ? a * (1.0f / l) : fb; }
+struct ColorB { std::uint8_t r, g, b, a; };
+
+// ---- aux geometry (renderer vt+0x638 -> CAuxGeomCB) ----------------------------------------------
+constexpr std::uint32_t kFlags = 0x40000000u /*AlphaBlended*/ | 0x00800000u /*DepthWriteOff*/;  // 3D, cull none, depth test on
+void* Aux()
+{
+    auto* env = SSystemGlobalEnvironment::GetInstance();
+    if (!env || !env->pRenderer) return nullptr;
+    return VCall<void*>(env->pRenderer, 0x638 / 8);
+}
+
+constexpr int kMaxTri = 2400;          // vertices
+V3     g_vtx[kMaxTri];
+ColorB g_col[kMaxTri];
+int    g_nv = 0;
+inline void Tri(V3 a, ColorB ca, V3 b, ColorB cb, V3 c, ColorB cc)
+{
+    if (g_nv + 3 > kMaxTri) return;
+    g_vtx[g_nv] = a; g_col[g_nv++] = ca;
+    g_vtx[g_nv] = b; g_col[g_nv++] = cb;
+    g_vtx[g_nv] = c; g_col[g_nv++] = cc;
+}
+
+// ---- prediction ----------------------------------------------------------------------------------
+constexpr int kMaxPts = 220;
+V3    g_pts[kMaxPts];
+V3    g_vel[kMaxPts];
+float g_s[kMaxPts];        // path length
+int   g_np = 0;
+bool  g_hit = false;
+V3    g_hp{}, g_hn{ 0, 0, 1 };
+
+// last prediction, for the calibration log on release / hit
+float g_lastSpeed = 0, g_lastDraw = 0;
+V3    g_lastPos{}, g_lastDir{}, g_lastImpact{};
+bool  g_lastHitOk = false;
+double g_lastLog = 0;
+
+bool Ray(V3 a, V3 b, V3& hp, V3& hn)
+{
+    auto* env = SSystemGlobalEnvironment::GetInstance();
+    if (!f_rwi || !env || !env->pPhysicalWorld) return false;
+    const V3 d = b - a;
+    RayHit h{};
+    const int n = f_rwi(env->pPhysicalWorld, &a.x, &d.x, 0x11F, 0x40F, &h, 1, nullptr, 0, nullptr, 0, "TrajectoryPreview");
+    if (n <= 0 || h.dist <= 0.0f) return false;
+    hp = { h.pt[0], h.pt[1], h.pt[2] }; hn = { h.n[0], h.n[1], h.n[2] };
+    return true;
+}
+
+void Simulate(V3 p0, V3 v0)
+{
+    g_np = 0; g_hit = false;
+    g_pts[0] = p0; g_vel[0] = v0; g_s[0] = 0; g_np = 1;
+    float t = 0, s = 0;
+    const float sp = Len(v0) > 1.0f ? Len(v0) : 1.0f;
+    while (g_np < kMaxPts) {
+        const float ds = (0.12f + 0.025f * s) > 4.0f ? 4.0f : (0.12f + 0.025f * s);   // dense near, sparse far
+        t += ds / sp;
+        const V3 p = { p0.x + v0.x * t, p0.y + v0.y * t, p0.z + v0.z * t - 0.5f * g_grav * t * t };
+        const V3 v = { v0.x, v0.y, v0.z - g_grav * t };
+        const V3 prev = g_pts[g_np - 1];
+        const float seg = Len(p - prev);
+        if (s > 0.5f) {                                     // skip own bow / hands
+            V3 hp{}, hn{};
+            if (Ray(prev, p, hp, hn)) {
+                s += Len(hp - prev);
+                g_pts[g_np] = hp; g_vel[g_np] = v; g_s[g_np] = s; ++g_np;
+                g_hit = true; g_hp = hp; g_hn = hn;
+                return;
+            }
+        }
+        s += seg;
+        g_pts[g_np] = p; g_vel[g_np] = v; g_s[g_np] = s; ++g_np;
+        if (s > 320.0f || t > 9.0f) return;
+    }
+}
+
+void Render(float draw)
+{
+    void* aux = Aux();
+    if (!aux || g_np < 2) return;
+    g_nv = 0;
+    const V3 up{ 0, 0, 1 };
+    const bool full = draw >= 0.999f;
+    // colour: still drawing = cool white, full draw = warm gold
+    const std::uint8_t cr = full ? 255 : 225, cg = full ? 214 : 235, cb = full ? 120 : 255;
+    auto alphaAt = [&](float s, float base) -> std::uint8_t {
+        float a = base;
+        if (s < 1.6f) a *= (s / 1.6f);                       // fade in from the arrow tip
+        const float far = g_s[g_np - 1];
+        if (!g_hit && s > far - 20.0f) a *= (far - s) / 20.0f; // fade out where nothing is hit
+        if (a < 0) a = 0;
+        return static_cast<std::uint8_t>(a);
+    };
+    auto ribbon = [&](float width, std::uint8_t r, std::uint8_t g, std::uint8_t b, float baseA) {
+        for (int i = 0; i + 1 < g_np; ++i) {
+            const V3 s0 = Norm(Cross(g_vel[i], up)) * (width * 0.5f);
+            const V3 s1 = Norm(Cross(g_vel[i + 1], up)) * (width * 0.5f);
+            const V3 a = g_pts[i] - s0, b2 = g_pts[i] + s0, c = g_pts[i + 1] - s1, d = g_pts[i + 1] + s1;
+            const ColorB k0{ r, g, b, alphaAt(g_s[i], baseA) }, k1{ r, g, b, alphaAt(g_s[i + 1], baseA) };
+            Tri(a, k0, b2, k0, c, k1);
+            Tri(b2, k0, d, k1, c, k1);
+        }
+    };
+    ribbon(g_width * 1.9f, 0, 0, 0, 70.0f);                // soft dark edge for contrast
+    ribbon(g_width, cr, cg, cb, 170.0f);
+    if (g_hit) {                                            // ring on the hit surface
+        const V3 n = Norm(g_hn, up);
+        const V3 u = Norm(Cross(n, std::fabs(n.z) < 0.9f ? up : V3{ 1, 0, 0 }));
+        const V3 w = Cross(n, u);
+        const V3 c = g_hp + n * 0.015f;
+        const float ro = g_ring, ri = g_ring * 0.66f;
+        const ColorB k{ cr, cg, cb, 210 };
+        constexpr int seg = 28;
+        for (int i = 0; i < seg; ++i) {
+            const float a0 = 6.2831853f * i / seg, a1 = 6.2831853f * (i + 1) / seg;
+            const V3 o0 = c + u * (std::cos(a0) * ro) + w * (std::sin(a0) * ro);
+            const V3 o1 = c + u * (std::cos(a1) * ro) + w * (std::sin(a1) * ro);
+            const V3 i0 = c + u * (std::cos(a0) * ri) + w * (std::sin(a0) * ri);
+            const V3 i1 = c + u * (std::cos(a1) * ri) + w * (std::sin(a1) * ri);
+            Tri(o0, k, o1, k, i0, k);
+            Tri(o1, k, i1, k, i0, k);
+        }
+    }
+    if (g_nv == 0) return;
+    std::uint32_t oldF = 0, tmp = 0, newF = kFlags;
+    VCall<void*>(aux, 0x10 / 8, &oldF);                        // GetRenderFlags(&out)
+    VCall<void*>(aux, 0x08 / 8, &tmp, &newF);                  // SetRenderFlags(&old, &new)
+    VCall<void>(aux, 0xA0 / 8, static_cast<const V3*>(g_vtx), static_cast<std::uint32_t>(g_nv),
+                static_cast<const ColorB*>(g_col));          // DrawTriangles(v, n, colours*)
+    VCall<void*>(aux, 0x08 / 8, &tmp, &oldF);                  // restore
+}
 
 double Now()
 {
-    auto* env = SSystemGlobalEnvironment::GetInstance();
-    return (env && env->pTimer) ? env->pTimer->GetCurrTimeD(Offsets::ITimer::ETIMER_GAME) : 0.0;
+    LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+    return static_cast<double>(c.QuadPart) / static_cast<double>(f.QuadPart);
 }
 
-bool ViewCamera(Vec3& pos, Vec3& dir)
+void Preview(void* action, float draw)
 {
-    auto* env = SSystemGlobalEnvironment::GetInstance();
-    if (!env || !env->pSystem) return false;
-    const CCamera& cam = env->pSystem->GetViewCamera();
-    pos = cam.m_Matrix.GetTranslation();
-    dir = cam.GetViewdir();
-    return true;
-}
+    if (!g_on || !g_ready) return;
+    auto* fw = CCryAction::GetInstance();
+    if (!fw) return;
+    void* player = fw->GetClientActor();
+    if (!player) return;
+    void* owner = At<void*>(action, 0x60);
+    if (!owner) return;
+    void* actor = VCall<void*>(owner, 2);                      // [action+0x60]->vt[2]()
+    if (actor != player) return;                               // only the player's own shot
+    void* holder = At<void*>(actor, 0x280);
+    if (!holder) return;
+    void* ctx = f_shootCtx(holder);
+    if (!ctx) return;
+    void* weapon = At<void*>(ctx, 0x40);
+    void* ammo   = At<void*>(ctx, 0x48);
+    void* stats  = At<void*>(actor, 0x668);
+    if (!weapon || !ammo || !stats) return;
 
-// ------------------------------------------------------------------ input (polled) ------
-// v2: the game's action maps consume fire/aim input before IInputEventListener sees it, so the
-// buttons are polled every frame straight from Windows: mouse via GetAsyncKeyState, pad via XInput
-// (analog triggers 0..255, also logged so the draw input is known).
-struct KeyState { const char* name; bool down = false; double since = 0.0; int peak = 0; };
-KeyState g_mouse1{ "mouse1" }, g_mouse2{ "mouse2" }, g_trigR{ "pad_RT" }, g_trigL{ "pad_LT" };
-double   g_lastRelease = -100.0;
-const char* g_lastReleaseKey = "";
-double   g_lastHeld = 0.0;
-Vec3     g_relCam{}, g_relDir{};
-bool g_relPredOk = false; Vec3 g_relPred{}; float g_relPredSpeed = 0.0f;
-bool g_predOk = false; Vec3 g_pred{}; float g_predSpeed = 0.0f;   // predicted impact of the last drawn frame
+    draw = draw < 0 ? 0 : (draw > 1 ? 1 : draw);
+    float frame[9] = {};
+    f_fireFrame(nullptr, frame, actor, weapon);
+    const V3 pos{ frame[0], frame[1], frame[2] };
+    const V3 dir = Norm(V3{ frame[6], frame[7], frame[8] }, V3{ 0, 1, 0 });
+    const float speed = f_speed(nullptr, draw, weapon, ammo, stats);
+    if (!(speed > 0.5f && speed < 2000.0f)) return;
 
-struct XPad { WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; };
-struct XState { DWORD packet; XPad pad; };
-using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XState*);
-XInputGetStateFn g_xget = nullptr;
+    Simulate(pos, dir * speed);
+    Render(draw);
 
-void LoadXInput()
-{
-    const char* dlls[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
-    for (auto* n : dlls) {
-        if (HMODULE h = LoadLibraryA(n)) {
-            g_xget = reinterpret_cast<XInputGetStateFn>(GetProcAddress(h, "XInputGetState"));
-            if (g_xget) { TP_LOG("xinput: %s", n); return; }
-        }
-    }
-    TP_LOG("xinput: not found (pad polling off)");
-}
-
-bool GameFocused()
-{
-    DWORD pid = 0;
-    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
-    return pid == GetCurrentProcessId();
-}
-
-void Step(KeyState& k, bool down, int value)
-{
-    const double t = Now();
-    if (down && !k.down) {
-        k.down = true; k.since = t; k.peak = value;
-        if (g_log) TP_LOG("press %s t=%.3f val=%d", k.name, t, value);
-    } else if (down) {
-        if (value > k.peak) k.peak = value;
-    } else if (k.down) {
-        k.down = false;
-        const double held = t - k.since;
-        Vec3 p{}, d{};
-        ViewCamera(p, d);
-        if (g_log) TP_LOG("release %s t=%.3f held=%.3f peak=%d cam=(%.3f,%.3f,%.3f) dir=(%.4f,%.4f,%.4f)",
-                          k.name, t, held, k.peak, p.x, p.y, p.z, d.x, d.y, d.z);
-        g_lastRelease = t; g_lastReleaseKey = k.name; g_lastHeld = held; g_relCam = p; g_relDir = d;
-        g_relPredOk = g_predOk; g_relPred = g_pred; g_relPredSpeed = g_predSpeed;
-        if (g_log && g_predOk) TP_LOG("  predicted impact (%.3f,%.3f,%.3f) v=%.1f", g_pred.x, g_pred.y, g_pred.z, g_predSpeed);
+    g_lastSpeed = speed; g_lastDraw = draw; g_lastPos = pos; g_lastDir = dir;
+    g_lastHitOk = g_hit; g_lastImpact = g_hp;
+    if (g_log && Now() - g_lastLog > 1.0) {
+        g_lastLog = Now();
+        TP_LOG("draw=%.3f v=%.2f pos=(%.2f,%.2f,%.2f) dir=(%.3f,%.3f,%.3f) pts=%d hit=%d (%.2f,%.2f,%.2f) path=%.1f",
+               draw, speed, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z, g_np, g_hit ? 1 : 0, g_hp.x, g_hp.y, g_hp.z,
+               g_s[g_np - 1]);
     }
 }
 
-void PollInput()
+bool g_faulted = false;
+void SafePreview(void* action, float draw)
 {
-    const bool focus = GameFocused();
-    Step(g_mouse1, focus && (GetAsyncKeyState(VK_LBUTTON) & 0x8000), 255);
-    Step(g_mouse2, focus && (GetAsyncKeyState(VK_RBUTTON) & 0x8000), 255);
-    int lt = 0, rt = 0;
-    if (g_xget) {
-        for (DWORD i = 0; i < 4; ++i) {
-            XState st{};
-            if (g_xget(i, &st) == ERROR_SUCCESS) { lt = st.pad.lt; rt = st.pad.rt; break; }
-        }
-    }
-    Step(g_trigR, rt > 30, rt);
-    Step(g_trigL, lt > 30, lt);
+    if (g_faulted) return;
+    __try { Preview(action, draw); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_faulted = true; TP_LOG("preview faulted -- disabled for this session"); }
 }
 
-// periodic sample while something is held: camera + trigger, so draw/aim behaviour is visible
-double g_lastSample = 0.0;
-void SampleHeld()
+std::int64_t __fastcall hkCharging(void* self, float dt)
 {
-    const double t = Now();
-    if (t - g_lastSample < 0.25) return;
-    g_lastSample = t;
-    Vec3 p{}, d{};
-    ViewCamera(p, d);
-    TP_LOG("hold t=%.3f m1=%d m2=%d RT=%d LT=%d cam=(%.3f,%.3f,%.3f) dir=(%.4f,%.4f,%.4f)",
-           t, g_mouse1.down ? 1 : 0, g_mouse2.down ? 1 : 0, g_trigR.down ? g_trigR.peak : 0, g_trigL.down ? g_trigL.peak : 0,
-           p.x, p.y, p.z, d.x, d.y, d.z);
+    const std::int64_t r = o_charging(self, dt);
+    if (r != 0) return r;                                      // action finishing / switching: do not touch it
+    float p = 0.0f;
+    __try { p = At<float>(self, 0xA8); } __except (EXCEPTION_EXECUTE_HANDLER) { return r; }
+    SafePreview(self, p);
+    return r;
+}
+std::int64_t __fastcall hkAiming(void* self, float dt)
+{
+    const std::int64_t r = o_aiming(self, dt);
+    if (r != 0) return r;
+    SafePreview(self, 1.0f);
+    return r;
+}
+std::int64_t __fastcall hkInstant(void* self, float dt)
+{
+    const std::int64_t r = o_instant(self, dt);
+    if (r != 0) return r;
+    SafePreview(self, 1.0f);
+    return r;
 }
 
-// ------------------------------------------------------------------ physics ray --------
-// IPhysicalWorld::RayWorldIntersection inline helper of WHGame 1.5.6 (RVA 0x4846E4), the one the
-// 3D engine's GetBottomLevel uses: (world, &org, &dir(len=ray length), objtypes, flags, hits,
-// nMaxHits, pSkipEnts, nSkipEnts, pForeignData, iForeignData, nameTag).  The prologue bytes are
-// checked first; on mismatch raycasting is disabled and the arc is drawn without collision.
-struct RayHit { float dist; void* pCollider; int ipart, partid; short surface_idx, idmatOrg;
-                int foreignIdx, iNode; Vec3 pt; Vec3 n; int bTerrain, iPrim; void* next; char pad[32]; };
-using RwiFn = int(__fastcall*)(void* world, const Vec3* org, const Vec3* dir, int objtypes, unsigned flags,
-                               RayHit* hits, int nMax, void* skip, int nSkip, void* fd, int ifd, const char* tag);
-RwiFn g_rwi = nullptr;
-
-void InitRay()
-{
-    const auto addr = REL::Offset(0x4846E4).address();
-    static const unsigned char sig[] = { 0x48,0x8B,0xC4,0x48,0x89,0x58,0x08,0x48,0x89,0x70,0x10,0x48,0x89,0x78,0x18 };
-    if (std::memcmp(reinterpret_cast<void*>(addr), sig, sizeof(sig)) == 0) g_rwi = reinterpret_cast<RwiFn>(addr);
-    TP_LOG("raycast: %s", g_rwi ? "ok" : "signature mismatch, collision off");
-}
-
-bool Ray(const Vec3& a, const Vec3& b, Vec3& hit, Vec3& nrm)
-{
-    auto* env = SSystemGlobalEnvironment::GetInstance();
-    if (!g_rwi || !env || !env->pPhysicalWorld) return false;
-    const Vec3 dir = b - a;
-    RayHit h{};
-    int n = 0;
-    __try {
-        n = g_rwi(env->pPhysicalWorld, &a, &dir, 0x11F /*ent_all*/, 0x2000F, &h, 1, nullptr, 0, nullptr, 0, "TrajectoryProbe");
-    } __except (EXCEPTION_EXECUTE_HANDLER) { g_rwi = nullptr; TP_LOG("raycast faulted -- collision off"); return false; }
-    if (n <= 0 || h.dist <= 0.0f) return false;
-    hit = h.pt; nrm = h.n;
-    return true;
-}
-
-// ------------------------------------------------------------------ HUD drawing --------
-float g_width  = 0.035f;   // tp_width : ribbon width in metres (world space -> perspective thinning)
-float g_vmin   = 0.10f;    // tp_vmin  : speed fraction at zero draw
-float g_ox = 0.06f, g_oy = 0.35f, g_oz = -0.12f;  // tp_ox/oy/oz: launch point rel. to camera (right, fwd, up)
-float g_skip   = 0.8f;     // tp_skip  : metres of path ignored by collision (own body / bow)
-
-std::shared_ptr<Offsets::IFlashPlayer> HudPlayer()
-{
-    auto* env = SSystemGlobalEnvironment::GetInstance();
-    if (!env || !env->pFlashUI) return nullptr;
-    _smart_ptr<Offsets::IUIElement> elem;
-    env->pFlashUI->GetUIElement(elem, "hud");
-    if (!elem) return nullptr;
-    return elem->GetFlashPlayer();
-}
-
-float g_stageW = 1920.0f, g_stageH = 1080.0f;
-
-bool ToStage(const Vec3& w, float& x, float& y)
-{
-    auto* env = SSystemGlobalEnvironment::GetInstance();
-    float sx, sy, sz;
-    if (!env->pRenderer->ProjectToScreen(w.x, w.y, w.z, &sx, &sy, &sz)) return false;
-    if (sz > 1.0f || sz < 0.0f) return false;
-    // ProjectToScreen gives percent of the (super-resolution) render target; the HUD movie
-    // has its own stage size, so map percent -> stage units (v2 used render pixels: 2/3 offset).
-    x = sx * 0.01f * g_stageW;
-    y = sy * 0.01f * g_stageH;
-    return true;
-}
-
-bool  g_hadDrawing = false;
-
-void Call(Offsets::FlashVarPtr& mc, const char* fn, const SFlashVarValue* a, unsigned n)
-{
-    mc->Invoke(fn, a, n, static_cast<SFlashVarValue*>(nullptr));
-}
-
-void DrawArc(bool show)
-{
-    auto fp = HudPlayer();
-    if (!fp) return;
-    Offsets::FlashVarPtr mc;
-    if (!fp->GetVariable("_root.tpProbe", mc.put()) || !mc) {
-        Offsets::FlashVarPtr root;
-        if (!fp->GetVariable("_root", root.put()) || !root) return;
-        if (!root->CreateEmptyMovieClip(mc.put(), "tpProbe", 16000) || !mc) return;
-        auto* env = SSystemGlobalEnvironment::GetInstance();
-        if (fp->GetWidth() > 0) { g_stageW = static_cast<float>(fp->GetWidth()); g_stageH = static_cast<float>(fp->GetHeight()); }
-        TP_LOG("HUD clip created stage=%dx%d render=%dx%d", fp->GetWidth(), fp->GetHeight(),
-               env->pRenderer->GetWidth(), env->pRenderer->GetHeight());
-    }
-    if (g_hadDrawing) { Call(mc, "clear", nullptr, 0); g_hadDrawing = false; }
-    if (!show) return;
-
-    Vec3 cam{}, fwd{};
-    if (!ViewCamera(cam, fwd)) return;
-    const Vec3 up(0, 0, 1);
-    Vec3 right = fwd.Cross(up); if (right.GetLengthSquared() < 1e-6f) right = Vec3(1, 0, 0); right.Normalize();
-    const Vec3 camUp = right.Cross(fwd);
-    const Vec3 p0 = cam + right * g_ox + fwd * g_oy + camUp * g_oz;
-
-    const KeyState& k = g_mouse1.down ? g_mouse1 : g_trigR;
-    float ratio = static_cast<float>((Now() - k.since) / (g_full > 0.01f ? g_full : 1.2f));
-    ratio = ratio < 0 ? 0 : (ratio > 1 ? 1 : ratio);
-    const float speed = g_v0 * (g_vmin + (1.0f - g_vmin) * ratio);
-    Vec3 vel = fwd * speed;
-
-    // --- simulate: analytic parabola sampled with growing step, collision per segment ----------
-    constexpr int kMax = 72;
-    Vec3 pts[kMax + 1]; Vec3 vels[kMax + 1];
-    int n = 0; pts[0] = p0; vels[0] = vel;
-    float path = 0.0f; bool hit = false; Vec3 hp{}, hn(0, 0, 1);
-    float t = 0.0f;
-    for (int i = 1; i <= kMax; ++i) {
-        const float dt = 0.012f + 0.004f * i;          // dense near the bow, sparse far away
-        t += dt;
-        const Vec3 p(p0.x + vel.x * t, p0.y + vel.y * t, p0.z + vel.z * t - 0.5f * g_g * t * t);
-        const Vec3 v(vel.x, vel.y, vel.z - g_g * t);
-        const Vec3& prev = pts[i - 1];
-        const float seg = (p - prev).GetLength();
-        if (path + seg > g_skip) {
-            Vec3 h{}, nn{};
-            const Vec3 a = (path < g_skip) ? prev + (p - prev) * ((g_skip - path) / seg) : prev;
-            if (Ray(a, p, h, nn)) { pts[i] = h; vels[i] = v; n = i; hit = true; hp = h; hn = nn; break; }
-        }
-        path += seg; pts[i] = p; vels[i] = v; n = i;
-        if (path > 300.0f) break;
-    }
-    g_predOk = hit; g_pred = hp; g_predSpeed = speed;
-
-    // --- ribbon: world-space strip of width tp_width, edges projected -> perspective thinning ---
-    float lx[kMax + 1], ly[kMax + 1], rx[kMax + 1], ry[kMax + 1]; bool ok[kMax + 1];
-    float dist[kMax + 1];
-    for (int i = 0; i <= n; ++i) {
-        Vec3 side = vels[i].Cross(up);
-        if (side.GetLengthSquared() < 1e-6f) side = right; side.Normalize();
-        const Vec3 L = pts[i] - side * (g_width * 0.5f), R = pts[i] + side * (g_width * 0.5f);
-        ok[i] = ToStage(L, lx[i], ly[i]) && ToStage(R, rx[i], ry[i]);
-        dist[i] = (pts[i] - cam).GetLength();
-    }
-    // bands: alpha fades in over the first metres (no fat blob at the bow) and out at range
-    const SFlashVarValue outline[3] = { 1.0f, 0x101010u, 45.0f };
-    Call(mc, "lineStyle", outline, 3);
-    constexpr int kBand = 6;
-    for (int b0 = 0; b0 < n; b0 += kBand) {
-        const int b1 = (b0 + kBand < n) ? b0 + kBand : n;
-        bool all = true; for (int i = b0; i <= b1; ++i) all = all && ok[i];
-        if (!all) continue;
-        const float d = dist[(b0 + b1) / 2];
-        float a = 80.0f;
-        if (d < 3.0f) a *= (d - 0.4f) / 2.6f;
-        if (d > 60.0f) a *= 60.0f / d;
-        if (a < 4.0f) continue;
-        const SFlashVarValue fill[2] = { 0xF2EEDCu, a };
-        Call(mc, "beginFill", fill, 2);
-        { const SFlashVarValue p[2] = { lx[b0], ly[b0] }; Call(mc, "moveTo", p, 2); }
-        for (int i = b0 + 1; i <= b1; ++i) { const SFlashVarValue p[2] = { lx[i], ly[i] }; Call(mc, "lineTo", p, 2); }
-        for (int i = b1; i >= b0; --i)     { const SFlashVarValue p[2] = { rx[i], ry[i] }; Call(mc, "lineTo", p, 2); }
-        Call(mc, "endFill", nullptr, 0);
-    }
-    // --- impact marker: ring lying on the hit surface (world circle -> perspective ellipse) ----
-    if (hit) {
-        Vec3 nn = hn; if (nn.GetLengthSquared() < 1e-4f) nn = up; nn.Normalize();
-        Vec3 u = nn.Cross(std::fabs(nn.z) < 0.9f ? up : Vec3(1, 0, 0)); u.Normalize();
-        const Vec3 w = nn.Cross(u);
-        const Vec3 c = hp + nn * 0.02f;
-        const float ro = 0.22f, ri = 0.15f;
-        float ox[25], oy[25], ix[25], iy[25]; bool good = true;
-        for (int i = 0; i <= 24 && good; ++i) {
-            const float th = 6.2831853f * i / 24.0f, cs = std::cos(th), sn = std::sin(th);
-            good = ToStage(c + u * (cs * ro) + w * (sn * ro), ox[i], oy[i]) &&
-                   ToStage(c + u * (cs * ri) + w * (sn * ri), ix[i], iy[i]);
-        }
-        if (good) {
-            const SFlashVarValue fill[2] = { 0xFFD27Au, 85.0f };
-            Call(mc, "beginFill", fill, 2);
-            { const SFlashVarValue p[2] = { ox[0], oy[0] }; Call(mc, "moveTo", p, 2); }
-            for (int i = 1; i <= 24; ++i) { const SFlashVarValue p[2] = { ox[i], oy[i] }; Call(mc, "lineTo", p, 2); }
-            { const SFlashVarValue p[2] = { ix[0], iy[0] }; Call(mc, "moveTo", p, 2); }   // inner path -> hole
-            for (int i = 1; i <= 24; ++i) { const SFlashVarValue p[2] = { ix[i], iy[i] }; Call(mc, "lineTo", p, 2); }
-            Call(mc, "endFill", nullptr, 0);
-        }
-    }
-    g_hadDrawing = true;
-}
-
-// ------------------------------------------------------------------ missile hits -------
+// ---- calibration: actual impacts vs. last prediction ----------------------------------------------
 class {
 public:
     static bool Install()
@@ -338,15 +312,10 @@ protected:
         __try {
             if (g_log && ctx->m_type == wh::rpgmodule::E_DamageEventType::MissileHit) {
                 const Vec3& h = ctx->m_hitPosition;
-                const float dx = h.x - g_relCam.x, dy = h.y - g_relCam.y, dz = h.z - g_relCam.z;
-                TP_LOG("hit t=%.3f pos=(%.3f,%.3f,%.3f) missile=%llu dtRelease=%.3f held=%.3f key=%s dist=%.2f",
-                       Now(), h.x, h.y, h.z, static_cast<unsigned long long>(ctx->m_missileWuid.m_value),
-                       Now() - g_lastRelease, g_lastHeld, g_lastReleaseKey, std::sqrt(dx*dx+dy*dy+dz*dz));
-                if (g_relPredOk) {
-                    const Vec3 e = h - g_relPred;
-                    TP_LOG("  pred=(%.3f,%.3f,%.3f) err=%.2f (dz=%.2f) v=%.1f", g_relPred.x, g_relPred.y, g_relPred.z,
-                           e.GetLength(), e.z, g_relPredSpeed);
-                }
+                const V3 hv{ h.x, h.y, h.z };
+                TP_LOG("hit (%.2f,%.2f,%.2f) lastPred draw=%.3f v=%.2f predImpact=%d (%.2f,%.2f,%.2f) err=%.2f",
+                       h.x, h.y, h.z, g_lastDraw, g_lastSpeed, g_lastHitOk ? 1 : 0,
+                       g_lastImpact.x, g_lastImpact.y, g_lastImpact.z, g_lastHitOk ? Len(hv - g_lastImpact) : -1.0f);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         return ret;
@@ -354,47 +323,46 @@ protected:
     static inline REL::Relocation<decltype(&thunk)> orig;
 } hkDamage;
 
-// ------------------------------------------------------------------ tick ---------------
-void Tick()
+bool HookAt(std::size_t rva, void* detour, void** orig)
 {
-    PollInput();
-    const bool holding = g_mouse1.down || g_mouse2.down || g_trigR.down || g_trigL.down;
-    if (holding && g_log) SampleHeld();
-    DrawArc(g_draw && (g_mouse1.down || g_trigR.down));
-    KCSE::GetTaskInterface()->AddTask(&Tick);
+    void* t = reinterpret_cast<void*>(REL::Offset(rva).address());
+    return MH_CreateHook(t, detour, orig) == MH_OK && MH_EnableHook(t) == MH_OK;
 }
 
 bool g_started = false;
 
 }  // namespace
 
-KCSE_PLUGIN_INFO("TrajectoryProbe", "zz_levelcap modpack", 1);
+KCSE_PLUGIN_INFO("TrajectoryProbe", "zz_levelcap modpack", 4);
 KCSE_PLUGIN_LOAD(kcse)
 {
+    const std::uint32_t stamp = REL::Module::get().timestamp();
+    if (stamp != kGameStamp) {
+        TP_LOG("v4: WHGame build %08X is not 1.5.6 (%08X) -- staying off, nothing hooked", stamp, kGameStamp);
+        return true;
+    }
     if (MH_Initialize() != MH_OK && MH_Initialize() != MH_ERROR_ALREADY_INITIALIZED) return false;
-    const bool hooked = hkDamage.Install();
+    f_shootCtx  = reinterpret_cast<ShootCtxFn>(REL::Offset(kShootCtx).address());
+    f_fireFrame = reinterpret_cast<FireFrameFn>(REL::Offset(kGetFireFrame).address());
+    f_speed     = reinterpret_cast<LaunchSpdFn>(REL::Offset(kLaunchSpeed).address());
+    f_rwi       = reinterpret_cast<RwiFn>(REL::Offset(kRwiHelper).address());
+    const bool h1 = HookAt(kChargingUpdate, reinterpret_cast<void*>(&hkCharging), reinterpret_cast<void**>(&o_charging));
+    const bool h2 = HookAt(kAimingUpdate, reinterpret_cast<void*>(&hkAiming), reinterpret_cast<void**>(&o_aiming));
+    const bool h3 = HookAt(kInstantUpdate, reinterpret_cast<void*>(&hkInstant), reinterpret_cast<void**>(&o_instant));
+    const bool h4 = hkDamage.Install();
+    g_ready = h1 && h2 && h3;
     kcse->GetMessagingInterface()->RegisterListener([](KCSE::Message* msg) {
         auto* env = SSystemGlobalEnvironment::GetInstance();
         if (!env || msg->type != KCSE::IMessagingInterface::kMessage_DataLoaded || g_started) return;
         g_started = true;
         if (env->pConsole) {
-            env->pConsole->RegisterCVarInt("tp_draw", &g_draw, g_draw, VF_NULL, "TrajectoryProbe: test arc on/off");
-            env->pConsole->RegisterCVarInt("tp_log", &g_log, g_log, VF_NULL, "TrajectoryProbe: logging on/off");
-            env->pConsole->RegisterCVarFloat("tp_v0", &g_v0, g_v0, VF_NULL, "TrajectoryProbe: TEST arc full-draw speed");
-            env->pConsole->RegisterCVarFloat("tp_g", &g_g, g_g, VF_NULL, "TrajectoryProbe: TEST arc gravity");
-            env->pConsole->RegisterCVarFloat("tp_full", &g_full, g_full, VF_NULL, "TrajectoryProbe: seconds to full draw");
-            env->pConsole->RegisterCVarFloat("tp_width", &g_width, g_width, VF_NULL, "TrajectoryProbe: ribbon width (m)");
-            env->pConsole->RegisterCVarFloat("tp_vmin", &g_vmin, g_vmin, VF_NULL, "TrajectoryProbe: speed fraction at zero draw");
-            env->pConsole->RegisterCVarFloat("tp_ox", &g_ox, g_ox, VF_NULL, "TrajectoryProbe: launch offset right (m)");
-            env->pConsole->RegisterCVarFloat("tp_oy", &g_oy, g_oy, VF_NULL, "TrajectoryProbe: launch offset forward (m)");
-            env->pConsole->RegisterCVarFloat("tp_oz", &g_oz, g_oz, VF_NULL, "TrajectoryProbe: launch offset up (m)");
-            env->pConsole->RegisterCVarFloat("tp_skip", &g_skip, g_skip, VF_NULL, "TrajectoryProbe: path metres ignored by collision");
+            env->pConsole->RegisterCVarInt("tp_on", &g_on, g_on, VF_NULL, "Trajectory preview on/off");
+            env->pConsole->RegisterCVarInt("tp_log", &g_log, g_log, VF_NULL, "Trajectory preview: calibration log");
+            env->pConsole->RegisterCVarFloat("tp_width", &g_width, g_width, VF_NULL, "Trajectory preview: ribbon width (m)");
+            env->pConsole->RegisterCVarFloat("tp_g", &g_grav, g_grav, VF_NULL, "Trajectory preview: gravity");
+            env->pConsole->RegisterCVarFloat("tp_ring", &g_ring, g_ring, VF_NULL, "Trajectory preview: impact ring radius (m)");
         }
-        LoadXInput();
-        InitRay();
-        KCSE::GetTaskInterface()->AddTask(&Tick);
-        TP_LOG("started");
     });
-    TP_LOG("loaded (hit hook %s)", hooked ? "ok" : "FAILED");
+    TP_LOG("v4 loaded: hooks charging=%d aiming=%d instant=%d hit=%d -> %s", h1, h2, h3, h4, g_ready ? "ready" : "OFF");
     return true;
 }
