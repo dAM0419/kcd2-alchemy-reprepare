@@ -371,12 +371,15 @@ bool HookAt(std::size_t rva, void* detour, void** orig)
 
 bool g_started = false;
 bool g_tickFault = false;
+void SafeDraw()
+{
+    if (g_tickFault) return;
+    __try { DrawShared(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_tickFault = true; TP_LOG("draw faulted -- drawing disabled"); }
+}
 void Tick()
 {
-    if (!g_tickFault) {
-        __try { DrawShared(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { g_tickFault = true; TP_LOG("draw faulted -- drawing disabled"); }
-    }
+    SafeDraw();
     KCSE::GetTaskInterface()->AddTask(&Tick);
 }
 
