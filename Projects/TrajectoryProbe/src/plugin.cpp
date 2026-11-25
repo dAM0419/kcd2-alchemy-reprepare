@@ -23,6 +23,7 @@
 #include "crysystem/CCryAction.h"
 #include "crysystem/SSystemGlobalEnvironment.h"
 #include "REL.h"
+#include "Offsets/vtables/ITimer.h"
 
 namespace {
 
@@ -377,10 +378,40 @@ void SafeDraw()
     __try { DrawShared(); }
     __except (EXCEPTION_EXECUTE_HANDLER) { g_tickFault = true; TP_LOG("draw faulted -- drawing disabled"); }
 }
-void Tick()
+
+// CCamera::UpdateFrustum (0x537BA4) runs on the renderer's main thread every frame (the same hook point the
+// public Aim Preview mod uses).  Aux geometry submitted on that thread goes to the renderer's own buffer and
+// is actually rendered.  Submit at most once per frame (UI timer stamp) and only on that thread.
+constexpr std::size_t kFrustum = 0x537BA4;
+using FrustumFn = void(__fastcall*)(void*, void*, void*, void*);
+FrustumFn o_frustum = nullptr;
+double g_lastFrame = -1.0;
+std::uint32_t MainTid()
 {
+    auto* env = SSystemGlobalEnvironment::GetInstance();
+    if (!env || !env->pRenderer) return 0;
+    void* th = At<void*>(env->pRenderer, 0xF8);
+    return th ? At<std::uint32_t>(th, 0xF0) : 0;
+}
+void OnFrustum()
+{
+    if (!g_on || !g_ready || g_shN == 0) return;
+    if (GetCurrentThreadId() != MainTid()) return;
+    auto* env = SSystemGlobalEnvironment::GetInstance();
+    if (!env || !env->pTimer) return;
+    const double f = env->pTimer->GetCurrTimeD(Offsets::ITimer::ETIMER_UI);
+    if (f == g_lastFrame) return;
+    g_lastFrame = f;
     SafeDraw();
-    KCSE::GetTaskInterface()->AddTask(&Tick);
+}
+void SafeOnFrustum()
+{
+    __try { OnFrustum(); } __except (EXCEPTION_EXECUTE_HANDLER) { g_tickFault = true; }
+}
+void __fastcall hkFrustum(void* a, void* b, void* c, void* d)
+{
+    o_frustum(a, b, c, d);
+    SafeOnFrustum();
 }
 
 }  // namespace
@@ -402,7 +433,8 @@ KCSE_PLUGIN_LOAD(kcse)
     const bool h2 = HookAt(kAimingUpdate, reinterpret_cast<void*>(&hkAiming), reinterpret_cast<void**>(&o_aiming));
     const bool h3 = HookAt(kInstantUpdate, reinterpret_cast<void*>(&hkInstant), reinterpret_cast<void**>(&o_instant));
     const bool h4 = hkDamage.Install();
-    g_ready = h1 && h2 && h3;
+    const bool h5 = HookAt(kFrustum, reinterpret_cast<void*>(&hkFrustum), reinterpret_cast<void**>(&o_frustum));
+    g_ready = h1 && h2 && h3 && h5;
     kcse->GetMessagingInterface()->RegisterListener([](KCSE::Message* msg) {
         auto* env = SSystemGlobalEnvironment::GetInstance();
         if (!env || msg->type != KCSE::IMessagingInterface::kMessage_DataLoaded || g_started) return;
@@ -414,8 +446,7 @@ KCSE_PLUGIN_LOAD(kcse)
             env->pConsole->RegisterCVarFloat("tp_g", &g_grav, g_grav, VF_NULL, "Trajectory preview: gravity");
             env->pConsole->RegisterCVarFloat("tp_ring", &g_ring, g_ring, VF_NULL, "Trajectory preview: impact ring radius (m)");
         }
-        KCSE::GetTaskInterface()->AddTask(&Tick);
     });
-    TP_LOG("v4 loaded: hooks charging=%d aiming=%d instant=%d hit=%d -> %s", h1, h2, h3, h4, g_ready ? "ready" : "OFF");
+    TP_LOG("v4.2 loaded: hooks charging=%d aiming=%d instant=%d hit=%d frustum=%d -> %s", h1, h2, h3, h4, h5, g_ready ? "ready" : "OFF");
     return true;
 }
