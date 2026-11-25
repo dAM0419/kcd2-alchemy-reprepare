@@ -30,7 +30,7 @@ jobs:
         run: |
           mkdir -p out
           cp build.log out/ || true
-          find "$BUILD_DIR" -name 'AlchemyReprepare.dll' -exec cp {} out/ \; || true
+          find "$BUILD_DIR" \( -name 'AlchemyReprepare.dll' -o -name 'TrajectoryProbe.dll' \) -exec cp {} out/ \; || true
           git config user.name "ci"; git config user.email "ci@users.noreply.github.com"
           git checkout --orphan build-out
           git rm -rf --cached . >/dev/null
