@@ -87,7 +87,9 @@ inline V3 Norm(V3 a, V3 fb = { 1, 0, 0 }) { const float l = Len(a); return l > 1
 struct ColorB { std::uint8_t r, g, b, a; };
 
 // ---- aux geometry (renderer vt+0x638 -> CAuxGeomCB) ----------------------------------------------
-constexpr std::uint32_t kFlags = 0x40000000u /*AlphaBlended*/ | 0x00800000u /*DepthWriteOff*/;  // 3D, cull none, depth test on
+// KCD2's aux DrawLines sets 0x20000000 itself for translucent colours (alpha 1..254) -> that bit is "alpha
+// blended" in this build (the stock CE3 header's 2<<29 = 0x40000000 is NOT; v4.0-4.2 used it and drew nothing).
+constexpr std::uint32_t kFlags = 0x20000000u /*AlphaBlended*/ | 0x00800000u /*DepthWriteOff*/;  // 3D, cull none, depth test on
 void* Aux()
 {
     auto* env = SSystemGlobalEnvironment::GetInstance();
@@ -170,6 +172,9 @@ V3     g_shV[kMaxTri];
 ColorB g_shC[kMaxTri];
 int    g_shN = 0;
 double g_shStamp = -1.0;
+int    g_dbgLine = 1;                    // tp_debugline
+V3     g_lnV[kMaxPts * 2];
+int    g_lnN = 0;
 double Now();
 void Publish()
 {
@@ -177,6 +182,8 @@ void Publish()
     std::memcpy(g_shV, g_vtx, sizeof(V3) * g_nv);
     std::memcpy(g_shC, g_col, sizeof(ColorB) * g_nv);
     g_shN = g_nv; g_shStamp = Now();
+    g_lnN = 0;                                              // line list: segment pairs along the path
+    for (int i = 0; i + 1 < g_np && g_lnN + 2 <= kMaxPts * 2; ++i) { g_lnV[g_lnN++] = g_pts[i]; g_lnV[g_lnN++] = g_pts[i + 1]; }
     ReleaseSRWLockExclusive(&g_lock);
 }
 DWORD g_hookTid = 0;
@@ -193,6 +200,11 @@ void DrawShared()                       // main thread, every frame
             VCall<void*>(aux, 0x08 / 8, &tmp, &newF);              // SetRenderFlags(&old, &new)
             VCall<void>(aux, 0xA0 / 8, static_cast<const V3*>(g_shV), static_cast<std::uint32_t>(g_shN),
                         static_cast<const ColorB*>(g_shC));      // DrawTriangles(v, n, colours*)
+            if (g_dbgLine && g_lnN > 1) {                          // diagnostic centre line, opaque, pixel width
+                const ColorB c{ 255, 60, 60, 255 };
+                VCall<void>(aux, 0x68 / 8, static_cast<const V3*>(g_lnV), static_cast<std::uint32_t>(g_lnN),
+                            &c, 2.0f);                           // DrawLines(v, n, col&, thickness)
+            }
             VCall<void*>(aux, 0x08 / 8, &tmp, &oldF);              // restore
         }
         static bool once = false;
@@ -444,9 +456,10 @@ KCSE_PLUGIN_LOAD(kcse)
             env->pConsole->RegisterCVarInt("tp_log", &g_log, g_log, VF_NULL, "Trajectory preview: calibration log");
             env->pConsole->RegisterCVarFloat("tp_width", &g_width, g_width, VF_NULL, "Trajectory preview: ribbon width (m)");
             env->pConsole->RegisterCVarFloat("tp_g", &g_grav, g_grav, VF_NULL, "Trajectory preview: gravity");
+            env->pConsole->RegisterCVarInt("tp_debugline", &g_dbgLine, g_dbgLine, VF_NULL, "Trajectory preview: red diagnostic centre line");
             env->pConsole->RegisterCVarFloat("tp_ring", &g_ring, g_ring, VF_NULL, "Trajectory preview: impact ring radius (m)");
         }
     });
-    TP_LOG("v4.2 loaded: hooks charging=%d aiming=%d instant=%d hit=%d frustum=%d -> %s", h1, h2, h3, h4, h5, g_ready ? "ready" : "OFF");
+    TP_LOG("v4.3 loaded: hooks charging=%d aiming=%d instant=%d hit=%d frustum=%d -> %s", h1, h2, h3, h4, h5, g_ready ? "ready" : "OFF");
     return true;
 }
