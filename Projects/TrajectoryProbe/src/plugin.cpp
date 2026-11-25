@@ -1,4 +1,5 @@
 // TrajectoryProbe -- measurement build for a ranged-weapon trajectory preview (KCD2 1.5.6).
+// v2: input polled (mouse GetAsyncKeyState + XInput pad), proximity scan removed.
 // Logs (to kcd.log, prefix [TP]):
 //   * every press/release of the fire/aim keys with the game time (draw duration),
 //   * the view camera position/direction at each release,
@@ -22,7 +23,6 @@
 #include "crysystem/SSystemGlobalEnvironment.h"
 #include "REL.h"
 #include "Offsets/vtables/ITimer.h"
-#include "Offsets/vtables/IInputEventListener.h"
 
 namespace {
 
@@ -53,129 +53,88 @@ bool ViewCamera(Vec3& pos, Vec3& dir)
     return true;
 }
 
-// ------------------------------------------------------------------ input -------------
-struct KeyState { bool down = false; double since = 0.0; };
-KeyState g_mouse1, g_mouse2, g_trigR, g_trigL;
+// ------------------------------------------------------------------ input (polled) ------
+// v2: the game's action maps consume fire/aim input before IInputEventListener sees it, so the
+// buttons are polled every frame straight from Windows: mouse via GetAsyncKeyState, pad via XInput
+// (analog triggers 0..255, also logged so the draw input is known).
+struct KeyState { const char* name; bool down = false; double since = 0.0; int peak = 0; };
+KeyState g_mouse1{ "mouse1" }, g_mouse2{ "mouse2" }, g_trigR{ "pad_RT" }, g_trigL{ "pad_LT" };
 double   g_lastRelease = -100.0;
 const char* g_lastReleaseKey = "";
 double   g_lastHeld = 0.0;
+Vec3     g_relCam{}, g_relDir{};
 
-KeyState* KeyFor(const char* name)
+struct XPad { WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; };
+struct XState { DWORD packet; XPad pad; };
+using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XState*);
+XInputGetStateFn g_xget = nullptr;
+
+void LoadXInput()
 {
-    if (!name) return nullptr;
-    if (!_stricmp(name, "mouse1")) return &g_mouse1;
-    if (!_stricmp(name, "mouse2")) return &g_mouse2;
-    if (!_stricmp(name, "xi_triggerr")) return &g_trigR;
-    if (!_stricmp(name, "xi_triggerl")) return &g_trigL;
-    return nullptr;
-}
-
-struct InputListener final : Offsets::IInputEventListener {
-    bool OnInputEvent(const Offsets::SInputEvent& e) override
-    {
-        KeyState* k = KeyFor(e.keyName);
-        if (!k) return false;
-        const int st = static_cast<int>(e.state);
-        const double t = Now();
-        if (st == 1 && !k->down) {            // pressed
-            k->down = true; k->since = t;
-            if (g_log) TP_LOG("press %s t=%.3f", e.keyName, t);
-        } else if (st == 2 && k->down) {      // released
-            k->down = false;
-            const double held = t - k->since;
-            Vec3 p{}, d{};
-            ViewCamera(p, d);
-            if (g_log) TP_LOG("release %s t=%.3f held=%.3f cam=(%.3f,%.3f,%.3f) dir=(%.4f,%.4f,%.4f)",
-                              e.keyName, t, held, p.x, p.y, p.z, d.x, d.y, d.z);
-            g_lastRelease = t; g_lastReleaseKey = e.keyName; g_lastHeld = held;
+    const char* dlls[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
+    for (auto* n : dlls) {
+        if (HMODULE h = LoadLibraryA(n)) {
+            g_xget = reinterpret_cast<XInputGetStateFn>(GetProcAddress(h, "XInputGetState"));
+            if (g_xget) { TP_LOG("xinput: %s", n); return; }
         }
-        return false;   // never consume
     }
-    bool OnInputEventUI(const void*) override { return false; }
-    int  GetPriority() const override { return 0; }
-    bool _vf3(const void*) override { return false; }
-} g_input;
-
-// ------------------------------------------------------------------ projectile tracks ---
-struct Track { uint32_t id; double t0; Vec3 last; double tLast; int n; bool fast; };
-std::vector<Track> g_tracks;
-std::unordered_set<uint32_t> g_nearBefore;   // entities near the camera just before release
-
-int Proximity(const Vec3& c, float r, Offsets::IEntity** out, int cap)
-{
-    auto* env = SSystemGlobalEnvironment::GetInstance();
-    if (!env || !env->pEntitySystem) return 0;
-    struct ProximityQuery {           // CE3 SEntityProximityQuery layout (KCD1-proven slot [25])
-        AABB box; void* pEntityClass; uint32_t nEntityFlags; void** pEntities; int nCount;
-    } q{};
-    q.box = AABB(Vec3(c.x - r, c.y - r, c.z - r), Vec3(c.x + r, c.y + r, c.z + r));
-    int n = 0;
-    __try {
-        n = env->pEntitySystem->QueryProximity(&q);
-        if (n > cap) n = cap;
-        for (int i = 0; i < n; ++i) out[i] = reinterpret_cast<Offsets::IEntity*>(q.pEntities[i]);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { n = -1; }
-    return n;
+    TP_LOG("xinput: not found (pad polling off)");
 }
 
-bool EntityPos(uint32_t id, Vec3& pos, const char** name)
+bool GameFocused()
 {
-    auto* env = SSystemGlobalEnvironment::GetInstance();
-    if (!env || !env->pEntitySystem) return false;
-    __try {
-        auto* e = env->pEntitySystem->GetEntity(id);
-        if (!e) return false;
-        e->GetWorldPos(pos);
-        if (name) *name = e->GetName();
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    return pid == GetCurrentProcessId();
 }
 
-void ScanNear(bool baseline)
-{
-    Vec3 c{}, d{};
-    if (!ViewCamera(c, d)) return;
-    Offsets::IEntity* ents[256];
-    const int n = Proximity(c, 4.0f, ents, 256);
-    if (n < 0) { static bool once = false; if (!once) { once = true; TP_LOG("QueryProximity faulted -- scan disabled"); } return; }
-    for (int i = 0; i < n; ++i) {
-        uint32_t id = 0;
-        __try { id = ents[i]->GetId(); } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
-        if (baseline) { g_nearBefore.insert(id); continue; }
-        if (g_nearBefore.count(id)) continue;
-        bool known = false;
-        for (auto& t : g_tracks) if (t.id == id) { known = true; break; }
-        if (known) continue;
-        Vec3 p{}; const char* nm = "";
-        if (!EntityPos(id, p, &nm)) continue;
-        g_tracks.push_back(Track{ id, Now(), p, Now(), 0, false });
-        if (g_log) TP_LOG("new id=%u name=%s t=%.3f pos=(%.3f,%.3f,%.3f) dtRelease=%.3f held=%.3f key=%s",
-                          id, nm ? nm : "?", Now(), p.x, p.y, p.z, Now() - g_lastRelease, g_lastHeld, g_lastReleaseKey);
-    }
-}
-
-void UpdateTracks()
+void Step(KeyState& k, bool down, int value)
 {
     const double t = Now();
-    for (size_t i = 0; i < g_tracks.size();) {
-        auto& tr = g_tracks[i];
-        Vec3 p{};
-        const bool alive = EntityPos(tr.id, p, nullptr);
-        const double dt = t - tr.tLast;
-        if (alive && dt > 0.0) {
-            const float dx = p.x - tr.last.x, dy = p.y - tr.last.y, dz = p.z - tr.last.z;
-            const float sp = std::sqrt(dx * dx + dy * dy + dz * dz) / static_cast<float>(dt);
-            if (sp > 8.0f) tr.fast = true;
-            if (tr.fast && g_log)
-                TP_LOG("trk id=%u t=%.4f pos=(%.3f,%.3f,%.3f) v=%.2f", tr.id, t, p.x, p.y, p.z, sp);
-            tr.last = p; tr.tLast = t; ++tr.n;
-        }
-        const bool done = !alive || (t - tr.t0) > 4.0 || (!tr.fast && (t - tr.t0) > 0.5);
-        if (done) {
-            if (tr.fast && g_log) TP_LOG("end id=%u alive=%d samples=%d", tr.id, alive ? 1 : 0, tr.n);
-            g_tracks.erase(g_tracks.begin() + i);
-        } else ++i;
+    if (down && !k.down) {
+        k.down = true; k.since = t; k.peak = value;
+        if (g_log) TP_LOG("press %s t=%.3f val=%d", k.name, t, value);
+    } else if (down) {
+        if (value > k.peak) k.peak = value;
+    } else if (k.down) {
+        k.down = false;
+        const double held = t - k.since;
+        Vec3 p{}, d{};
+        ViewCamera(p, d);
+        if (g_log) TP_LOG("release %s t=%.3f held=%.3f peak=%d cam=(%.3f,%.3f,%.3f) dir=(%.4f,%.4f,%.4f)",
+                          k.name, t, held, k.peak, p.x, p.y, p.z, d.x, d.y, d.z);
+        g_lastRelease = t; g_lastReleaseKey = k.name; g_lastHeld = held; g_relCam = p; g_relDir = d;
     }
+}
+
+void PollInput()
+{
+    const bool focus = GameFocused();
+    Step(g_mouse1, focus && (GetAsyncKeyState(VK_LBUTTON) & 0x8000), 255);
+    Step(g_mouse2, focus && (GetAsyncKeyState(VK_RBUTTON) & 0x8000), 255);
+    int lt = 0, rt = 0;
+    if (g_xget) {
+        for (DWORD i = 0; i < 4; ++i) {
+            XState st{};
+            if (g_xget(i, &st) == ERROR_SUCCESS) { lt = st.pad.lt; rt = st.pad.rt; break; }
+        }
+    }
+    Step(g_trigR, rt > 30, rt);
+    Step(g_trigL, lt > 30, lt);
+}
+
+// periodic sample while something is held: camera + trigger, so draw/aim behaviour is visible
+double g_lastSample = 0.0;
+void SampleHeld()
+{
+    const double t = Now();
+    if (t - g_lastSample < 0.25) return;
+    g_lastSample = t;
+    Vec3 p{}, d{};
+    ViewCamera(p, d);
+    TP_LOG("hold t=%.3f m1=%d m2=%d RT=%d LT=%d cam=(%.3f,%.3f,%.3f) dir=(%.4f,%.4f,%.4f)",
+           t, g_mouse1.down ? 1 : 0, g_mouse2.down ? 1 : 0, g_trigR.down ? g_trigR.peak : 0, g_trigL.down ? g_trigL.peak : 0,
+           p.x, p.y, p.z, d.x, d.y, d.z);
 }
 
 // ------------------------------------------------------------------ HUD drawing --------
@@ -221,7 +180,7 @@ void DrawArc(bool show)
     mc->Invoke("clear", static_cast<const SFlashVarValue*>(nullptr), 0u, static_cast<SFlashVarValue*>(nullptr));
     Vec3 p0{}, d{};
     if (!ViewCamera(p0, d)) return;
-    const KeyState& k = g_mouse1.down ? g_mouse1 : g_trigR;
+    const KeyState& k = g_mouse1.down ? g_mouse1 : (g_trigR.down ? g_trigR : (g_trigL.down ? g_trigL : g_mouse2));
     float ratio = static_cast<float>((Now() - k.since) / (g_full > 0.01f ? g_full : 2.0f));
     if (ratio > 1.0f) ratio = 1.0f;
     const float v = g_v0 * (0.3f + 0.7f * ratio);
@@ -257,9 +216,10 @@ protected:
         __try {
             if (g_log && ctx->m_type == wh::rpgmodule::E_DamageEventType::MissileHit) {
                 const Vec3& h = ctx->m_hitPosition;
-                TP_LOG("hit t=%.3f pos=(%.3f,%.3f,%.3f) missile=%llu dtRelease=%.3f held=%.3f",
+                const float dx = h.x - g_relCam.x, dy = h.y - g_relCam.y, dz = h.z - g_relCam.z;
+                TP_LOG("hit t=%.3f pos=(%.3f,%.3f,%.3f) missile=%llu dtRelease=%.3f held=%.3f key=%s dist=%.2f",
                        Now(), h.x, h.y, h.z, static_cast<unsigned long long>(ctx->m_missileWuid.m_value),
-                       Now() - g_lastRelease, g_lastHeld);
+                       Now() - g_lastRelease, g_lastHeld, g_lastReleaseKey, std::sqrt(dx*dx+dy*dy+dz*dz));
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         return ret;
@@ -268,16 +228,11 @@ protected:
 } hkDamage;
 
 // ------------------------------------------------------------------ tick ---------------
-bool g_baselined = false;
-
 void Tick()
 {
-    const double t = Now();
-    const bool holding = g_mouse1.down || g_trigR.down;
-    if (holding && !g_baselined) { g_nearBefore.clear(); ScanNear(true); g_baselined = true; }
-    if (!holding) g_baselined = false;
-    if (t - g_lastRelease < 0.35) ScanNear(false);
-    UpdateTracks();
+    PollInput();
+    const bool holding = g_mouse1.down || g_mouse2.down || g_trigR.down || g_trigL.down;
+    if (holding && g_log) SampleHeld();
     DrawArc(g_draw && holding);
     KCSE::GetTaskInterface()->AddTask(&Tick);
 }
@@ -302,7 +257,7 @@ KCSE_PLUGIN_LOAD(kcse)
             env->pConsole->RegisterCVarFloat("tp_g", &g_g, g_g, VF_NULL, "TrajectoryProbe: TEST arc gravity");
             env->pConsole->RegisterCVarFloat("tp_full", &g_full, g_full, VF_NULL, "TrajectoryProbe: seconds to full draw");
         }
-        if (env->pInput) env->pInput->AddEventListener(&g_input);
+        LoadXInput();
         KCSE::GetTaskInterface()->AddTask(&Tick);
         TP_LOG("started");
     });
