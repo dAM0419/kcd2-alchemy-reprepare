@@ -48,7 +48,7 @@ int   g_on     = 1;        // tp_on
 int   g_log    = 1;        // tp_log
 float g_width  = 0.035f;   // tp_width : ribbon width (m)
 float g_grav   = 9.0f;     // tp_g     : gravity (arrow.xml)
-float g_ring   = 0.18f;    // tp_ring  : impact ring radius (m)
+float g_ring   = 0.075f;   // tp_ring  : impact disc radius (m) -- about a palm
 
 bool g_ready = false;      // all checks passed
 
@@ -101,6 +101,7 @@ constexpr int kMaxTri = 2400;          // vertices
 V3     g_vtx[kMaxTri];
 ColorB g_col[kMaxTri];
 int    g_nv = 0;
+int    g_nRibbon = 0;
 inline void Tri(V3 a, ColorB ca, V3 b, ColorB cb, V3 c, ColorB cc)
 {
     if (g_nv + 3 > kMaxTri) return;
@@ -170,9 +171,9 @@ void Simulate(V3 p0, V3 v0)
 SRWLOCK g_lock = SRWLOCK_INIT;
 V3     g_shV[kMaxTri];
 ColorB g_shC[kMaxTri];
-int    g_shN = 0;
+int    g_shN = 0, g_shRib = 0;
 double g_shStamp = -1.0;
-int    g_dbgLine = 1;                    // tp_debugline
+int    g_dbgLine = 0;                    // tp_debugline
 V3     g_lnV[kMaxPts * 2];
 int    g_lnN = 0;
 double Now();
@@ -181,7 +182,7 @@ void Publish()
     AcquireSRWLockExclusive(&g_lock);
     std::memcpy(g_shV, g_vtx, sizeof(V3) * g_nv);
     std::memcpy(g_shC, g_col, sizeof(ColorB) * g_nv);
-    g_shN = g_nv; g_shStamp = Now();
+    g_shN = g_nv; g_shRib = g_nRibbon; g_shStamp = Now();
     g_lnN = 0;                                              // line list: segment pairs along the path
     for (int i = 0; i + 1 < g_np && g_lnN + 2 <= kMaxPts * 2; ++i) { g_lnV[g_lnN++] = g_pts[i]; g_lnV[g_lnN++] = g_pts[i + 1]; }
     ReleaseSRWLockExclusive(&g_lock);
@@ -198,8 +199,15 @@ void DrawShared()                       // main thread, every frame
             std::uint32_t oldF = 0, tmp = 0, newF = kFlags;
             VCall<void*>(aux, 0x10 / 8, &oldF);                    // GetRenderFlags(&out)
             VCall<void*>(aux, 0x08 / 8, &tmp, &newF);              // SetRenderFlags(&old, &new)
-            VCall<void>(aux, 0xA0 / 8, static_cast<const V3*>(g_shV), static_cast<std::uint32_t>(g_shN),
-                        static_cast<const ColorB*>(g_shC));      // DrawTriangles(v, n, colours*)
+            VCall<void>(aux, 0xA0 / 8, static_cast<const V3*>(g_shV), static_cast<std::uint32_t>(g_shRib),
+                        static_cast<const ColorB*>(g_shC));      // ribbon: DrawTriangles(v, n, colours*)
+            if (g_shN > g_shRib) {                                 // impact disc: not hidden by grass / bumps
+                std::uint32_t mk = kFlags | 0x00400000u /*DepthTestOff*/, t2 = 0;
+                VCall<void*>(aux, 0x08 / 8, &t2, &mk);
+                VCall<void>(aux, 0xA0 / 8, static_cast<const V3*>(g_shV + g_shRib),
+                            static_cast<std::uint32_t>(g_shN - g_shRib), static_cast<const ColorB*>(g_shC + g_shRib));
+                VCall<void*>(aux, 0x08 / 8, &t2, &newF);
+            }
             if (g_dbgLine && g_lnN > 1) {                          // diagnostic centre line, opaque, pixel width
                 const ColorB c{ 255, 60, 60, 255 };
                 VCall<void>(aux, 0x68 / 8, static_cast<const V3*>(g_lnV), static_cast<std::uint32_t>(g_lnN),
@@ -220,17 +228,15 @@ void DrawShared()                       // main thread, every frame
     ReleaseSRWLockShared(&g_lock);
 }
 
-void Render(float draw)
+void Render(float /*draw*/)
 {
     if (g_np < 2) return;
     g_nv = 0;
     const V3 up{ 0, 0, 1 };
-    const bool full = draw >= 0.999f;
-    // colour: still drawing = cool white, full draw = warm gold
-    const std::uint8_t cr = full ? 255 : 225, cg = full ? 214 : 235, cb = full ? 120 : 255;
+    const std::uint8_t cr = 205, cg = 205, cb = 205;          // one neutral grey: the path itself shows the draw
     auto alphaAt = [&](float s, float base) -> std::uint8_t {
         float a = base;
-        if (s < 1.6f) a *= (s / 1.6f);                       // fade in from the arrow tip
+        a *= 0.35f + 0.65f * (s < 0.4f ? s / 0.4f : 1.0f);    // short, partial fade at the arrow tip only
         const float sEnd = g_s[g_np - 1];
         if (!g_hit && s > sEnd - 20.0f) a *= (sEnd - s) / 20.0f; // fade out where nothing is hit
         if (a < 0) a = 0;
@@ -247,23 +253,23 @@ void Render(float draw)
         }
     };
     ribbon(g_width * 1.9f, 0, 0, 0, 70.0f);                // soft dark edge for contrast
-    ribbon(g_width, cr, cg, cb, 170.0f);
-    if (g_hit) {                                            // ring on the hit surface
-        const V3 n = Norm(g_hn, up);
+    ribbon(g_width, cr, cg, cb, 175.0f);
+    g_nRibbon = g_nv;
+    if (g_hit) {                                            // palm-sized disc lying on the hit surface
+        V3 n = Norm(g_hn, up);
+        if (!(std::fabs(n.x) <= 1.01f && std::fabs(n.y) <= 1.01f && std::fabs(n.z) <= 1.01f)) n = up;
         const V3 u = Norm(Cross(n, std::fabs(n.z) < 0.9f ? up : V3{ 1, 0, 0 }));
         const V3 w = Cross(n, u);
-        const V3 c = g_hp + n * 0.015f;
-        const float ro = g_ring, ri = g_ring * 0.66f;
-        const ColorB k{ cr, cg, cb, 210 };
-        constexpr int seg = 28;
+        const V3 c = g_hp + n * 0.02f;
+        const float r = g_ring, ro = g_ring * 1.28f;
+        const ColorB fill{ cr, cg, cb, 225 }, edge{ 20, 20, 20, 200 };
+        constexpr int seg = 32;
         for (int i = 0; i < seg; ++i) {
             const float a0 = 6.2831853f * i / seg, a1 = 6.2831853f * (i + 1) / seg;
-            const V3 o0 = c + u * (std::cos(a0) * ro) + w * (std::sin(a0) * ro);
-            const V3 o1 = c + u * (std::cos(a1) * ro) + w * (std::sin(a1) * ro);
-            const V3 i0 = c + u * (std::cos(a0) * ri) + w * (std::sin(a0) * ri);
-            const V3 i1 = c + u * (std::cos(a1) * ri) + w * (std::sin(a1) * ri);
-            Tri(o0, k, o1, k, i0, k);
-            Tri(o1, k, i1, k, i0, k);
+            const V3 d0 = u * std::cos(a0) + w * std::sin(a0), d1 = u * std::cos(a1) + w * std::sin(a1);
+            Tri(c, fill, c + d0 * r, fill, c + d1 * r, fill);                        // disc
+            Tri(c + d0 * r, edge, c + d0 * ro, edge, c + d1 * r, edge);              // dark rim
+            Tri(c + d1 * r, edge, c + d0 * ro, edge, c + d1 * ro, edge);
         }
     }
     Publish();
@@ -311,9 +317,9 @@ void Preview(void* action, float draw)
     g_lastHitOk = g_hit; g_lastImpact = g_hp;
     if (g_log && Now() - g_lastLog > 1.0) {
         g_lastLog = Now();
-        TP_LOG("draw=%.3f v=%.2f pos=(%.2f,%.2f,%.2f) dir=(%.3f,%.3f,%.3f) pts=%d hit=%d (%.2f,%.2f,%.2f) path=%.1f",
+        TP_LOG("draw=%.3f v=%.2f pos=(%.2f,%.2f,%.2f) dir=(%.3f,%.3f,%.3f) pts=%d hit=%d (%.2f,%.2f,%.2f) n=(%.2f,%.2f,%.2f) path=%.1f",
                draw, speed, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z, g_np, g_hit ? 1 : 0, g_hp.x, g_hp.y, g_hp.z,
-               g_s[g_np - 1]);
+               g_hn.x, g_hn.y, g_hn.z, g_s[g_np - 1]);
     }
 }
 
@@ -460,6 +466,6 @@ KCSE_PLUGIN_LOAD(kcse)
             env->pConsole->RegisterCVarFloat("tp_ring", &g_ring, g_ring, VF_NULL, "Trajectory preview: impact ring radius (m)");
         }
     });
-    TP_LOG("v4.3 loaded: hooks charging=%d aiming=%d instant=%d hit=%d frustum=%d -> %s", h1, h2, h3, h4, h5, g_ready ? "ready" : "OFF");
+    TP_LOG("v4.4 loaded: hooks charging=%d aiming=%d instant=%d hit=%d frustum=%d -> %s", h1, h2, h3, h4, h5, g_ready ? "ready" : "OFF");
     return true;
 }
