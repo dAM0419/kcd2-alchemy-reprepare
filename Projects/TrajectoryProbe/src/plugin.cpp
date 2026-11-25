@@ -48,7 +48,7 @@ bool ViewCamera(Vec3& pos, Vec3& dir)
     auto* env = SSystemGlobalEnvironment::GetInstance();
     if (!env || !env->pSystem) return false;
     const CCamera& cam = env->pSystem->GetViewCamera();
-    pos = cam.GetPosition();
+    pos = cam.m_Matrix.GetTranslation();
     dir = cam.GetViewdir();
     return true;
 }
@@ -105,7 +105,9 @@ int Proximity(const Vec3& c, float r, Offsets::IEntity** out, int cap)
 {
     auto* env = SSystemGlobalEnvironment::GetInstance();
     if (!env || !env->pEntitySystem) return 0;
-    SEntityProximityQuery q;
+    struct ProximityQuery {           // CE3 SEntityProximityQuery layout (KCD1-proven slot [25])
+        AABB box; void* pEntityClass; uint32_t nEntityFlags; void** pEntities; int nCount;
+    } q{};
     q.box = AABB(Vec3(c.x - r, c.y - r, c.z - r), Vec3(c.x + r, c.y + r, c.z + r));
     int n = 0;
     __try {
@@ -213,10 +215,10 @@ void DrawArc(bool show)
         TP_LOG("HUD clip created");
     }
     if (!show) {
-        if (g_hadDrawing) { mc->Invoke("clear", nullptr, 0, nullptr); g_hadDrawing = false; }
+        if (g_hadDrawing) { mc->Invoke("clear", static_cast<const SFlashVarValue*>(nullptr), 0u, static_cast<SFlashVarValue*>(nullptr)); g_hadDrawing = false; }
         return;
     }
-    mc->Invoke("clear", nullptr, 0, nullptr);
+    mc->Invoke("clear", static_cast<const SFlashVarValue*>(nullptr), 0u, static_cast<SFlashVarValue*>(nullptr));
     Vec3 p0{}, d{};
     if (!ViewCamera(p0, d)) return;
     const KeyState& k = g_mouse1.down ? g_mouse1 : g_trigR;
@@ -225,7 +227,7 @@ void DrawArc(bool show)
     const float v = g_v0 * (0.3f + 0.7f * ratio);
     const Vec3 v0(d.x * v, d.y * v, d.z * v);
     SFlashVarValue ls[3] = { 2.0f, 0xFFFFFFu, 55.0f };
-    mc->Invoke("lineStyle", ls, 3, nullptr);
+    mc->Invoke("lineStyle", ls, 3u, static_cast<SFlashVarValue*>(nullptr));
     bool pen = false;
     for (int i = 1; i <= 60; ++i) {
         const float t = 0.02f * i * (1.0f + i * 0.05f);
@@ -233,7 +235,7 @@ void DrawArc(bool show)
         float x, y;
         if (!ToScreen(p, x, y)) { pen = false; continue; }
         SFlashVarValue a[2] = { x, y };
-        mc->Invoke(pen ? "lineTo" : "moveTo", a, 2, nullptr);
+        mc->Invoke(pen ? "lineTo" : "moveTo", a, 2u, static_cast<SFlashVarValue*>(nullptr));
         pen = true;
     }
     g_hadDrawing = true;
