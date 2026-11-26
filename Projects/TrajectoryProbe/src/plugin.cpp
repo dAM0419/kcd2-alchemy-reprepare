@@ -21,6 +21,7 @@
 
 #include "KCSE/KCSEAPI.h"
 #include "crysystem/CCryAction.h"
+#include "crysystem/CCamera.h"
 #include "crysystem/SSystemGlobalEnvironment.h"
 #include "REL.h"
 #include "Offsets/vtables/ITimer.h"
@@ -174,6 +175,12 @@ ColorB g_shC[kMaxTri];
 int    g_shN = 0, g_shRib = 0;
 double g_shStamp = -1.0;
 int    g_dbgLine = 0;                    // tp_debugline
+float  g_near = 1.5f;                    // tp_near : first metres drawn as an overlay (the bow hand hides them)
+V3     g_shP[kMaxPts];
+float  g_shS[kMaxPts];
+int    g_shNp = 0;
+bool   g_shHit = false;
+V3     g_shHp{}, g_shHn{ 0, 0, 1 };
 V3     g_lnV[kMaxPts * 2];
 int    g_lnN = 0;
 double Now();
@@ -183,11 +190,55 @@ void Publish()
     std::memcpy(g_shV, g_vtx, sizeof(V3) * g_nv);
     std::memcpy(g_shC, g_col, sizeof(ColorB) * g_nv);
     g_shN = g_nv; g_shRib = g_nRibbon; g_shStamp = Now();
+    g_shNp = g_np; std::memcpy(g_shP, g_pts, sizeof(V3) * g_np); std::memcpy(g_shS, g_s, sizeof(float) * g_np);
+    g_shHit = g_hit; g_shHp = g_hp; g_shHn = g_hn;
     g_lnN = 0;                                              // line list: segment pairs along the path
     for (int i = 0; i + 1 < g_np && g_lnN + 2 <= kMaxPts * 2; ++i) { g_lnV[g_lnN++] = g_pts[i]; g_lnV[g_lnN++] = g_pts[i + 1]; }
     ReleaseSRWLockExclusive(&g_lock);
 }
 DWORD g_hookTid = 0;
+// Thick aux lines are expanded to screen-space quads and are not hidden by the first-person hands (the red
+// test line proved it).  Used for (a) the first tp_near metres, which sit right behind the bow hand, with a
+// pixel width matched to the ribbon's perspective width, and (b) the rim of the impact disc so it never
+// disappears in grass.
+void DrawOverlays(void* aux)
+{
+    auto* env = SSystemGlobalEnvironment::GetInstance();
+    if (!env || !env->pSystem || g_shNp < 2) return;
+    const CCamera& cam = env->pSystem->GetViewCamera();
+    const Vec3 cp = cam.m_Matrix.GetTranslation();
+    const Vec3 cd = cam.GetViewdir();
+    const V3 camP{ cp.x, cp.y, cp.z }, camD{ cd.x, cd.y, cd.z };
+    const float fov = cam.m_fov > 0.1f && cam.m_fov < 3.0f ? cam.m_fov : 1.0f;
+    const float hpx = cam.m_Height > 100 ? static_cast<float>(cam.m_Height) : 1080.0f;
+    const float focal = (hpx * 0.5f) / std::tan(fov * 0.5f);
+    const ColorB grey{ 205, 205, 205, 175 };
+    for (int i = 0; i + 1 < g_shNp && g_shS[i] < g_near; ++i) {
+        V3 seg[2] = { g_shP[i], g_shP[i + 1] };
+        const float depth = Dot(((seg[0] + seg[1]) * 0.5f) - camP, camD);
+        if (depth < 0.05f) continue;
+        float px = g_width * focal / depth;
+        px = px < 1.5f ? 1.5f : (px > 60.0f ? 60.0f : px);
+        VCall<void>(aux, 0x68 / 8, static_cast<const V3*>(seg), 2u, &grey, px);   // DrawLines(v, n, col&, thickness)
+    }
+    if (g_shHit) {
+        V3 n = Norm(g_shHn, V3{ 0, 0, 1 });
+        if (!(std::fabs(n.x) <= 1.01f && std::fabs(n.y) <= 1.01f && std::fabs(n.z) <= 1.01f)) n = V3{ 0, 0, 1 };
+        const V3 u = Norm(Cross(n, std::fabs(n.z) < 0.9f ? V3{ 0, 0, 1 } : V3{ 1, 0, 0 }));
+        const V3 w = Cross(n, u);
+        const V3 c = g_shHp + n * 0.03f;
+        constexpr int seg = 32;
+        V3 rim[seg * 2];
+        for (int i = 0; i < seg; ++i) {
+            const float a0 = 6.2831853f * i / seg, a1 = 6.2831853f * (i + 1) / seg;
+            rim[i * 2]     = c + u * (std::cos(a0) * g_ring) + w * (std::sin(a0) * g_ring);
+            rim[i * 2 + 1] = c + u * (std::cos(a1) * g_ring) + w * (std::sin(a1) * g_ring);
+        }
+        const ColorB dark{ 25, 25, 25, 230 };
+        VCall<void>(aux, 0x68 / 8, static_cast<const V3*>(rim), static_cast<std::uint32_t>(seg * 2), &dark, 2.5f);
+    }
+}
+
 void DrawShared()                       // main thread, every frame
 {
     if (!g_on || !g_ready) return;
@@ -201,13 +252,10 @@ void DrawShared()                       // main thread, every frame
             VCall<void*>(aux, 0x08 / 8, &tmp, &newF);              // SetRenderFlags(&old, &new)
             VCall<void>(aux, 0xA0 / 8, static_cast<const V3*>(g_shV), static_cast<std::uint32_t>(g_shRib),
                         static_cast<const ColorB*>(g_shC));      // ribbon: DrawTriangles(v, n, colours*)
-            if (g_shN > g_shRib) {                                 // impact disc: not hidden by grass / bumps
-                std::uint32_t mk = kFlags | 0x00400000u /*DepthTestOff*/, t2 = 0;
-                VCall<void*>(aux, 0x08 / 8, &t2, &mk);
+            if (g_shN > g_shRib)                                   // impact disc (same, proven flags)
                 VCall<void>(aux, 0xA0 / 8, static_cast<const V3*>(g_shV + g_shRib),
                             static_cast<std::uint32_t>(g_shN - g_shRib), static_cast<const ColorB*>(g_shC + g_shRib));
-                VCall<void*>(aux, 0x08 / 8, &t2, &newF);
-            }
+            DrawOverlays(aux);
             if (g_dbgLine && g_lnN > 1) {                          // diagnostic centre line, opaque, pixel width
                 const ColorB c{ 255, 60, 60, 255 };
                 VCall<void>(aux, 0x68 / 8, static_cast<const V3*>(g_lnV), static_cast<std::uint32_t>(g_lnN),
@@ -236,7 +284,6 @@ void Render(float /*draw*/)
     const std::uint8_t cr = 205, cg = 205, cb = 205;          // one neutral grey: the path itself shows the draw
     auto alphaAt = [&](float s, float base) -> std::uint8_t {
         float a = base;
-        a *= 0.35f + 0.65f * (s < 0.4f ? s / 0.4f : 1.0f);    // short, partial fade at the arrow tip only
         const float sEnd = g_s[g_np - 1];
         if (!g_hit && s > sEnd - 20.0f) a *= (sEnd - s) / 20.0f; // fade out where nothing is hit
         if (a < 0) a = 0;
@@ -244,6 +291,7 @@ void Render(float /*draw*/)
     };
     auto ribbon = [&](float width, std::uint8_t r, std::uint8_t g, std::uint8_t b, float baseA) {
         for (int i = 0; i + 1 < g_np; ++i) {
+            if (g_s[i + 1] <= g_near) continue;                // near part: screen overlay (DrawOverlays)
             const V3 s0 = Norm(Cross(g_vel[i], up)) * (width * 0.5f);
             const V3 s1 = Norm(Cross(g_vel[i + 1], up)) * (width * 0.5f);
             const V3 a = g_pts[i] - s0, b2 = g_pts[i] + s0, c = g_pts[i + 1] - s1, d = g_pts[i + 1] + s1;
@@ -260,7 +308,7 @@ void Render(float /*draw*/)
         if (!(std::fabs(n.x) <= 1.01f && std::fabs(n.y) <= 1.01f && std::fabs(n.z) <= 1.01f)) n = up;
         const V3 u = Norm(Cross(n, std::fabs(n.z) < 0.9f ? up : V3{ 1, 0, 0 }));
         const V3 w = Cross(n, u);
-        const V3 c = g_hp + n * 0.02f;
+        const V3 c = g_hp + n * 0.03f;
         const float r = g_ring, ro = g_ring * 1.28f;
         const ColorB fill{ cr, cg, cb, 225 }, edge{ 20, 20, 20, 200 };
         constexpr int seg = 32;
@@ -463,9 +511,10 @@ KCSE_PLUGIN_LOAD(kcse)
             env->pConsole->RegisterCVarFloat("tp_width", &g_width, g_width, VF_NULL, "Trajectory preview: ribbon width (m)");
             env->pConsole->RegisterCVarFloat("tp_g", &g_grav, g_grav, VF_NULL, "Trajectory preview: gravity");
             env->pConsole->RegisterCVarInt("tp_debugline", &g_dbgLine, g_dbgLine, VF_NULL, "Trajectory preview: red diagnostic centre line");
+            env->pConsole->RegisterCVarFloat("tp_near", &g_near, g_near, VF_NULL, "Trajectory preview: metres drawn over the hands");
             env->pConsole->RegisterCVarFloat("tp_ring", &g_ring, g_ring, VF_NULL, "Trajectory preview: impact ring radius (m)");
         }
     });
-    TP_LOG("v4.4 loaded: hooks charging=%d aiming=%d instant=%d hit=%d frustum=%d -> %s", h1, h2, h3, h4, h5, g_ready ? "ready" : "OFF");
+    TP_LOG("v4.5 loaded: hooks charging=%d aiming=%d instant=%d hit=%d frustum=%d -> %s", h1, h2, h3, h4, h5, g_ready ? "ready" : "OFF");
     return true;
 }
