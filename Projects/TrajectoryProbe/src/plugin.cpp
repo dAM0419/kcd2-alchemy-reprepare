@@ -126,13 +126,24 @@ V3    g_lastPos{}, g_lastDir{}, g_lastImpact{};
 bool  g_lastHitOk = false;
 double g_lastLog = 0;
 
+// Ray query.  The game's own launch wall-check uses flags 0x40F with no collision-type mask, which in
+// CryPhysics means "geometry flagged geom_colltype_ray only" -- terrain and most statics, but NOT the
+// character / animal hit geometry (that is why v4.5 drew no disc on people and animals).  Here the mask is
+// explicit: every collision type except explosion-only (bit 2), foliage (4), foliage proxy (13) and AI
+// obstruct volumes (14), with rwi_colltype_any so geometry matching any one of them counts.  The player's own
+// physics (entity + held weapon, the same pair the fire routine skips) is excluded.
+constexpr unsigned kRayColl = 0xFFFFu & ~((1u << 2) | (1u << 4) | (1u << 13) | (1u << 14));
+constexpr unsigned kRayFlags = 0x40Fu | (kRayColl << 16);
+void* g_skip[2] = {};
+int   g_nSkip = 0;
 bool Ray(V3 a, V3 b, V3& hp, V3& hn)
 {
     auto* env = SSystemGlobalEnvironment::GetInstance();
     if (!f_rwi || !env || !env->pPhysicalWorld) return false;
     const V3 d = b - a;
     RayHit h{};
-    const int n = f_rwi(env->pPhysicalWorld, &a.x, &d.x, 0x11F, 0x40F, &h, 1, nullptr, 0, nullptr, 0, "TrajectoryPreview");
+    const int n = f_rwi(env->pPhysicalWorld, &a.x, &d.x, 0x11F, kRayFlags, &h, 1, g_nSkip ? g_skip : nullptr, g_nSkip,
+                        nullptr, 0, "TrajectoryPreview");
     if (n <= 0 || h.dist <= 0.0f) return false;
     hp = { h.pt[0], h.pt[1], h.pt[2] }; hn = { h.n[0], h.n[1], h.n[2] };
     return true;
@@ -358,6 +369,9 @@ void Preview(void* action, float draw)
     const float speed = f_speed(nullptr, draw, weapon, ammo, stats);
     if (!(speed > 0.5f && speed < 2000.0f)) return;
 
+    g_nSkip = 0;                                               // own body + weapon, as the fire routine does
+    if (void* ent = At<void*>(actor, 0x38)) { if (void* ph = VCall<void*>(ent, 0x278 / 8)) g_skip[g_nSkip++] = ph; }
+    if (void* wph = VCall<void*>(actor, 0x480 / 8)) g_skip[g_nSkip++] = wph;
     Simulate(pos, dir * speed);
     Render(draw);
 
@@ -515,6 +529,6 @@ KCSE_PLUGIN_LOAD(kcse)
             env->pConsole->RegisterCVarFloat("tp_ring", &g_ring, g_ring, VF_NULL, "Trajectory preview: impact ring radius (m)");
         }
     });
-    TP_LOG("v4.5 loaded: hooks charging=%d aiming=%d instant=%d hit=%d frustum=%d -> %s", h1, h2, h3, h4, h5, g_ready ? "ready" : "OFF");
+    TP_LOG("v4.6 loaded: hooks charging=%d aiming=%d instant=%d hit=%d frustum=%d -> %s", h1, h2, h3, h4, h5, g_ready ? "ready" : "OFF");
     return true;
 }
